@@ -38,7 +38,44 @@ const response = await fetch('部署到cloudflare后的网址', {
 接下来说说如何部署到 cloudflare 上
 
 
-## 登录 cloudflare 创建一个Workers
+## API（兼容 OpenAI）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/v1/audio/speech` | 合成语音，参数同 OpenAI `audio.speech.create` |
+| GET | `/v1/models`、`/v1/models/{id}` | 模型列表 / 详情 |
+| GET | `/v1/audio/voices?locale=zh-CN` | 扩展：可用音色列表（含风格 styles） |
+| POST | `/openai-fm/v1/audio/speech` | 旧路由，强制使用 openai.fm 后端 |
+
+`POST /v1/audio/speech` 参数：
+
+- `input`（必填）：要合成的文本，最长 50000 字符，超长会自动分段并发合成。行尾写 `[500]` 表示停顿 500ms。
+- `model`：`tts-1` / `edge-tts`（Edge TTS），`tts-1-hd`（Edge TTS，mp3 为 48kHz 192kbps），`gpt-4o-mini-tts` / `openai-fm`（openai.fm）。未知模型名按 Edge 处理。
+- `voice`：Edge 音色名（如 `zh-CN-XiaoxiaoNeural`），或 OpenAI 音色名 `alloy`、`ash`、`ballad`、`coral`、`echo`、`fable`、`onyx`、`nova`、`sage`、`shimmer`、`verse`、`marin`、`cedar`（映射到 Edge 的英文/多语言音色）。
+- `response_format`：`mp3`（默认）、`opus`、`wav`、`pcm`（24kHz 16bit 单声道，与 OpenAI 一致）。Edge 不支持 `aac`、`flac`。
+- `speed`：0.25–4.0。
+- `stream_format`：`audio`（默认，边合成边返回）或 `sse`（`speech.audio.delta` / `speech.audio.done` 事件）。
+- `instructions`：openai.fm 后端的语气提示词。
+- 扩展参数（仅 Edge）：`style`（如 `cheerful`）、`pitch`（Hz）、`volume`（1.0 = +100%）。
+
+错误响应为 OpenAI 格式：`{"error": {"message", "type", "param", "code"}}`，并带有对应的 HTTP 状态码（400/401/404/405/429/502）。
+
+### 用 wrangler 部署
+
+```bash
+npm install
+npx wrangler secret put API_KEY   # 可选，多个 key 用英文逗号分隔；不设置则不校验
+npx wrangler deploy
+```
+
+鉴权方式：`Authorization: Bearer <key>` 或 `x-api-key: <key>`。
+
+> 注意：openai.fm 是 OpenAI 的演示站，目前对程序化访问返回 Vercel 安全验证（429），该后端基本不可用。
+
+## 登录 cloudflare 创建一个Workers（旧版：在线编辑器粘贴代码）
+
+> 下面粘贴的代码是旧版本，推荐直接使用 `src/index.ts` 通过 wrangler 部署。
+
 
 > 网址 https://dash.cloudflare.com/   如何登录注册不再赘述
 

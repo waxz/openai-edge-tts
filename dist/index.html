@@ -813,7 +813,7 @@
 		},
  async generateSpeech(listener_text) {
  console.log(listener_text)
-	const workerUrl = `${window.location.origin}/openai-fm/v1/audio/speech`;
+	const workerUrl = `${window.location.origin}/v1/audio/speech`;
         const parsedText = typeof listener_text==='string'?listener_text:this.parseText();
 		if(!this.selectedVoice || this.selectedVoice=='No'){
 			

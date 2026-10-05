@@ -52,10 +52,11 @@ type ChunkSynthesizer = (text: string, req: SpeechRequest) => Promise<Uint8Array
 
 // Keeps a request well under the 50-subrequest limit of the Workers free plan.
 const MAX_INPUT_CHARS = 50_000;
-const EDGE_CHUNK_CHARS = 2000;
-const OPENAI_FM_CHUNK_CHARS = 900;
-// Small pieces get the first audio back sooner from a CPU-only Space.
-const KOKORO_CHUNK_CHARS = 300;
+// [first chunk, largest chunk] in characters; see splitText.
+const EDGE_CHUNK_CHARS: [number, number] = [100, 2000];
+const OPENAI_FM_CHUNK_CHARS: [number, number] = [200, 900];
+// A CPU-only Space is slow, so its chunks stay small.
+const KOKORO_CHUNK_CHARS: [number, number] = [50, 400];
 // Kokoro voice ids: language letter, gender letter, name (af_heart, zf_xiaoxiao, zm_100, ...).
 // Edge voice names never contain an underscore.
 const KOKORO_VOICE_RE = /^[abefhijpz][fm]_[a-z0-9]+$/;
@@ -314,14 +315,14 @@ async function handleSpeech(request: Request, env: Env, forcedProvider: Provider
     req.edgeEndpoint = parseEdgeEndpoint(env);
     if (req.provider === "kokoro") req.kokoro = kokoroConfig(env);
 
-    const synthesizers: Record<Provider, [ChunkSynthesizer, number]> = {
+    const synthesizers: Record<Provider, [ChunkSynthesizer, [number, number]]> = {
         edge: [getEdgeAudioChunk, EDGE_CHUNK_CHARS],
         "openai-fm": [getOpenaiFmAudioChunk, OPENAI_FM_CHUNK_CHARS],
         // FLAC streams can't be concatenated, so FLAC is synthesized in one piece.
-        kokoro: [getKokoroAudioChunk, req.response_format === "flac" ? MAX_INPUT_CHARS : KOKORO_CHUNK_CHARS],
+        kokoro: [getKokoroAudioChunk, req.response_format === "flac" ? [MAX_INPUT_CHARS, MAX_INPUT_CHARS] : KOKORO_CHUNK_CHARS],
     };
-    const [synthesize, maxChunk] = synthesizers[req.provider];
-    const chunks = splitText(req.input, maxChunk);
+    const [synthesize, [firstChunk, maxChunk]] = synthesizers[req.provider];
+    const chunks = splitText(req.input, maxChunk, firstChunk);
 
     // Synthesize the first chunk before responding, so upstream failures still produce a proper error status.
     const first = await synthesize(chunks[0], req);
@@ -475,31 +476,42 @@ function sseResponse(parts: AsyncGenerator<Uint8Array>, inputChars: number): Res
     });
 }
 
-// Split text into chunks of at most maxLen characters, preferring line, then sentence, then word boundaries.
-function splitText(text: string, maxLen: number): string[] {
-    const pieces: string[] = [];
+// Split text into chunks for synthesis. The first chunk is at most firstLen characters so audio
+// starts quickly; each later limit doubles up to maxLen, keeping the number of upstream requests low.
+// Chunks break at line ends, then sentence ends, then commas, and only as a last resort mid-sentence.
+function splitText(text: string, maxLen: number, firstLen = maxLen): string[] {
+    type Unit = { text: string; startsLine: boolean };
+    const queue: Unit[] = [];
     for (const line of text.trim().split("\n")) {
-        if (line.length <= maxLen) {
-            pieces.push(line);
-            continue;
-        }
-        for (const sentence of line.match(/[^。！？!?；;.]+[。！？!?；;.]*\s*/g) || [line]) {
-            for (let i = 0; i < sentence.length; i += maxLen) pieces.push(sentence.slice(i, i + maxLen));
-        }
+        if (!line.trim()) continue;
+        // "。！？；" end a sentence anywhere; ".!?;" only before whitespace, so "3.14" and "e.g.x" stay whole.
+        line.split(/(?<=[。！？；…])|(?<=[.!?;])(?=\s)/).forEach((t, i) => queue.push({ text: t, startsLine: i === 0 }));
     }
 
     const chunks: string[] = [];
+    let limit = Math.min(firstLen, maxLen);
     let current = "";
-    for (const piece of pieces) {
-        if (current && current.length + 1 + piece.length > maxLen) {
+    while (queue.length) {
+        const unit = queue.shift()!;
+        const joined = current ? current + (unit.startsLine ? "\n" : "") + unit.text : unit.text.trimStart();
+        if (joined.length <= limit) {
+            current = joined;
+        } else if (current.trim()) {
             chunks.push(current);
-            current = piece;
+            current = "";
+            limit = Math.min(limit * 2, maxLen);
+            queue.unshift(unit);
         } else {
-            current = current ? `${current}\n${piece}` : piece;
+            // A single sentence longer than the limit: split at commas, else cut it, at a space if possible.
+            const parts = unit.text.split(/(?<=[，,、：:])/);
+            const space = unit.text.lastIndexOf(" ", limit);
+            const cut = space > limit / 2 ? space : limit;
+            const pieces = parts.length > 1 ? parts : [unit.text.slice(0, cut), unit.text.slice(cut)];
+            queue.unshift(...pieces.filter(Boolean).map((t, i) => ({ text: t, startsLine: i === 0 && unit.startsLine })));
         }
     }
     if (current.trim()) chunks.push(current);
-    return chunks.filter((c) => c.trim());
+    return chunks;
 }
 
 // ---------------------------------------------------------------- Edge TTS backend

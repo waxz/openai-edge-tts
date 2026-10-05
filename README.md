@@ -49,7 +49,7 @@ const response = await fetch('部署到cloudflare后的网址', {
 
 `POST /v1/audio/speech` 参数：
 
-- `input`（必填）：要合成的文本，最长 50000 字符，超长会自动分段并发合成。行尾写 `[500]` 表示停顿 500ms。
+- `input`（必填）：要合成的文本，最长 50000 字符，超长会自动分段并发合成：首段约 100 字（在句号或逗号处断开），之后每段长度翻倍，首个音频通常 1 秒内返回。行尾写 `[500]` 表示停顿 500ms。
 - `model`：`kokoro`（Hugging Face Space，见下文），`tts-1` / `edge-tts`（Edge TTS），`tts-1-hd`（Edge TTS，mp3 为 48kHz 192kbps），`gpt-4o-mini-tts` / `openai-fm`（openai.fm）。未知模型名按 Edge 处理。
 - `voice`：Edge 音色名（如 `zh-CN-XiaoxiaoNeural`），或 OpenAI 音色名 `alloy`、`ash`、`ballad`、`coral`、`echo`、`fable`、`onyx`、`nova`、`sage`、`shimmer`、`verse`、`marin`、`cedar`（映射到 Edge 的英文/多语言音色）。
 - `response_format`：`mp3`（默认）、`opus`、`wav`、`pcm`（24kHz 16bit 单声道，与 OpenAI 一致）。Edge 不支持 `aac`、`flac`。

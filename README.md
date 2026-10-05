@@ -70,6 +70,17 @@ npx wrangler deploy
 
 鉴权方式：`Authorization: Bearer <key>` 或 `x-api-key: <key>`。
 
+### 两个免费的 Edge 接口（自动切换）
+
+本项目只使用免费、无需注册的服务。Edge TTS 有两个入口：
+
+| 接口 | 格式 | 风格 style | `[500]` 停顿 | 音色数 |
+|---|---|---|---|---|
+| 微软翻译 App token 接口（主） | mp3 / opus / wav / pcm | 支持 | 支持 | 约 840 |
+| Edge 浏览器“大声朗读” WebSocket（备用） | 仅 mp3 | 不支持（被服务端拒绝） | 忽略 | 约 320 |
+
+默认 `auto`：先走主接口，失败（5xx/网络错误）时 mp3 请求自动改走备用接口。可用环境变量 `EDGE_ENDPOINT` 固定为 `translator` 或 `readaloud`（在 `wrangler.toml` 的 `[vars]` 或控制台里设置）。
+
 > 注意：openai.fm 是 OpenAI 的演示站，目前对程序化访问返回 Vercel 安全验证（429），该后端基本不可用。
 
 ## 登录 cloudflare 创建一个Workers（旧版：在线编辑器粘贴代码）

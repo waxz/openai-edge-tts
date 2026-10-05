@@ -9,10 +9,18 @@
 //
 // Set the key with `wrangler secret put API_KEY` (comma-separate several keys).
 // When API_KEY is empty the API is open to everyone.
+//
+// Edge TTS is reached through two free endpoints: the Microsoft Translator app's token
+// endpoint (primary: every output format and speaking styles) and the Edge browser's
+// Read Aloud WebSocket (fallback: mp3 only, no styles). EDGE_ENDPOINT selects
+// "auto" (default: translator, then read aloud on failure), "translator" or "readaloud".
 
 export interface Env {
     API_KEY?: string;
+    EDGE_ENDPOINT?: string;
 }
+
+type EdgeEndpoint = "auto" | "translator" | "readaloud";
 
 type Provider = "edge" | "openai-fm";
 type ResponseFormat = "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm";
@@ -26,6 +34,7 @@ interface SpeechRequest {
     response_format: ResponseFormat;
     speed: number;
     stream_format: "audio" | "sse";
+    edgeEndpoint: EdgeEndpoint;
     // Edge-only extensions, kept for the web UI and existing callers
     volume: number;
     pitch: number;
@@ -43,6 +52,23 @@ const TOKEN_REFRESH_BEFORE_EXPIRY = 3 * 60;
 const UPSTREAM_TIMEOUT_MS = 30_000;
 const VOICES_CACHE_SECONDS = 6 * 3600;
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0";
+
+// Edge Read Aloud constants, kept in sync with https://github.com/rany2/edge-tts (constants.py)
+const READALOUD_BASE = "speech.platform.bing.com/consumer/speech/synthesize/readaloud";
+const READALOUD_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+const READALOUD_CHROMIUM_VERSION = "143.0.3650.75";
+const READALOUD_MAJOR = READALOUD_CHROMIUM_VERSION.split(".")[0];
+const READALOUD_HEADERS: Record<string, string> = {
+    "User-Agent": `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${READALOUD_MAJOR}.0.0.0 Safari/537.36 Edg/${READALOUD_MAJOR}.0.0.0`,
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Language": "en-US,en;q=0.9",
+    Pragma: "no-cache",
+    "Cache-Control": "no-cache",
+    Origin: "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+};
+const READALOUD_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
+// The service drops SSML messages over ~4 KB; 1000 chars stays below that even for CJK text.
+const READALOUD_CHUNK_CHARS = 1000;
 
 const MODELS: Record<string, Provider> = {
     "tts-1": "edge",
@@ -146,11 +172,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const method = request.method === "HEAD" ? "GET" : request.method;
 
     const routes: Array<[string, RegExp, (m: RegExpMatchArray) => Promise<Response>]> = [
-        ["POST", /^\/v1\/audio\/speech$/, () => handleSpeech(request, null)],
-        ["POST", /^\/openai-fm\/v1\/audio\/speech$/, () => handleSpeech(request, "openai-fm")],
+        ["POST", /^\/v1\/audio\/speech$/, () => handleSpeech(request, env, null)],
+        ["POST", /^\/openai-fm\/v1\/audio\/speech$/, () => handleSpeech(request, env, "openai-fm")],
         ["GET", /^\/v1\/models$/, async () => jsonResponse({ object: "list", data: Object.keys(MODELS).map(modelObject) })],
         ["GET", /^\/v1\/models\/([^/]+)$/, async (m) => handleRetrieveModel(decodeURIComponent(m[1]))],
-        ["GET", /^\/v1\/audio\/voices$/, () => handleListVoices(request)],
+        ["GET", /^\/v1\/audio\/voices$/, () => handleListVoices(request, env)],
     ];
 
     let pathMatched = false;
@@ -195,6 +221,11 @@ function handleOptions(request: Request): Response {
 
 // ---------------------------------------------------------------- models & voices
 
+function parseEdgeEndpoint(env: Env): EdgeEndpoint {
+    const value = (env.EDGE_ENDPOINT || "auto").toLowerCase();
+    return value === "translator" || value === "readaloud" ? value : "auto";
+}
+
 function modelObject(id: string) {
     return { id, object: "model", created: MODEL_CREATED, owned_by: MODELS[id] === "edge" ? "microsoft-edge-tts" : "openai-fm" };
 }
@@ -207,7 +238,7 @@ async function handleRetrieveModel(id: string): Promise<Response> {
 }
 
 // GET /v1/audio/voices?model=tts-1&locale=zh-CN
-async function handleListVoices(request: Request): Promise<Response> {
+async function handleListVoices(request: Request, env: Env): Promise<Response> {
     const params = new URL(request.url).searchParams;
     const model = params.get("model") || "tts-1";
     const locale = params.get("locale")?.toLowerCase();
@@ -217,10 +248,10 @@ async function handleListVoices(request: Request): Promise<Response> {
     }
 
     const aliases = Object.entries(OPENAI_VOICE_TO_EDGE).map(([id, target]) => ({ id, object: "voice", name: id, alias_of: target }));
-    let voices = (await getEdgeVoices()).map((v) => ({
+    let voices = (await getEdgeVoices(parseEdgeEndpoint(env))).map((v) => ({
         id: v.ShortName,
         object: "voice",
-        name: v.LocalName || v.DisplayName,
+        name: v.LocalName || v.DisplayName || v.FriendlyName,
         gender: v.Gender?.toLowerCase(),
         locale: v.Locale,
         locale_name: v.LocaleName,
@@ -232,25 +263,35 @@ async function handleListVoices(request: Request): Promise<Response> {
     return jsonResponse({ object: "list", data: locale ? voices : [...aliases, ...voices] });
 }
 
-async function getEdgeVoices(): Promise<any[]> {
+async function getEdgeVoices(edgeEndpoint: EdgeEndpoint): Promise<any[]> {
     const now = Date.now() / 1000;
     if (voicesCache && now - voicesCache.at < VOICES_CACHE_SECONDS) return voicesCache.voices;
 
-    const endpoint = await getEndpoint();
-    const response = await fetchWithTimeout(`https://${endpoint.r}.tts.speech.microsoft.com/cognitiveservices/voices/list`, {
-        headers: { Authorization: endpoint.t, "User-Agent": USER_AGENT },
-    });
-    if (!response.ok) {
-        throw new ApiError(502, `Edge TTS voice list error: ${response.status} ${await response.text()}`, "server_error", null, "upstream_error");
+    let voices: any[];
+    try {
+        if (edgeEndpoint === "readaloud") throw new Error("translator endpoint disabled");
+        const endpoint = await getEndpoint();
+        const response = await fetchWithTimeout(`https://${endpoint.r}.tts.speech.microsoft.com/cognitiveservices/voices/list`, {
+            headers: { Authorization: endpoint.t, "User-Agent": USER_AGENT },
+        });
+        if (!response.ok) {
+            throw new ApiError(502, `Edge TTS voice list error: ${response.status} ${await response.text()}`, "server_error", null, "upstream_error");
+        }
+        voices = await response.json();
+    } catch (error) {
+        if (edgeEndpoint === "translator") throw error;
+        console.warn("Translator voice list failed, falling back to Edge Read Aloud:", error);
+        voices = await getReadAloudVoices();
     }
-    voicesCache = { at: now, voices: await response.json() };
-    return voicesCache.voices;
+    voicesCache = { at: now, voices };
+    return voices;
 }
 
 // ---------------------------------------------------------------- speech
 
-async function handleSpeech(request: Request, forcedProvider: Provider | null): Promise<Response> {
+async function handleSpeech(request: Request, env: Env, forcedProvider: Provider | null): Promise<Response> {
     const req = await parseSpeechRequest(request, forcedProvider);
+    req.edgeEndpoint = parseEdgeEndpoint(env);
 
     const synthesize: ChunkSynthesizer = req.provider === "openai-fm" ? getOpenaiFmAudioChunk : getEdgeAudioChunk;
     const maxChunk = req.provider === "openai-fm" ? OPENAI_FM_CHUNK_CHARS : EDGE_CHUNK_CHARS;
@@ -379,7 +420,7 @@ async function parseSpeechRequest(request: Request, forcedProvider: Provider | n
     }
     const style = typeof body.style === "string" && /^[\w-]+$/.test(body.style) ? body.style : "general";
 
-    return { model, provider, input, voice: voice.trim(), instructions, response_format, speed, stream_format, volume, pitch, style };
+    return { model, provider, input, voice: voice.trim(), instructions, response_format, speed, stream_format, edgeEndpoint: "auto", volume, pitch, style };
 }
 
 // Server-sent events in the shape of OpenAI's `stream_format: "sse"`.
@@ -433,8 +474,45 @@ function splitText(text: string, maxLen: number): string[] {
 // ---------------------------------------------------------------- Edge TTS backend
 
 async function getEdgeAudioChunk(text: string, req: SpeechRequest): Promise<Uint8Array> {
+    const canReadAloud = req.response_format === "mp3";
+    if (req.edgeEndpoint === "readaloud") {
+        if (!canReadAloud) {
+            throw new ApiError(400, "The Edge Read Aloud endpoint only returns 'mp3'.", "invalid_request_error", "response_format", "unsupported_value");
+        }
+        return getReadAloudAudioChunk(text, req);
+    }
+    try {
+        return await getTranslatorAudioChunk(text, req);
+    } catch (error) {
+        // Client mistakes (bad voice, ...) would fail on the fallback too.
+        const upstreamFailure = !(error instanceof ApiError) || error.status >= 500;
+        if (req.edgeEndpoint === "translator" || !canReadAloud || !upstreamFailure) throw error;
+        console.warn("Translator endpoint failed, falling back to Edge Read Aloud:", error);
+        return getReadAloudAudioChunk(text, req);
+    }
+}
+
+function edgeVoiceName(voice: string): string {
+    return OPENAI_VOICE_TO_EDGE[voice.toLowerCase()] || voice;
+}
+
+function edgeProsody(req: SpeechRequest) {
+    const signed = (n: number, unit: string) => `${n >= 0 ? "+" : ""}${n}${unit}`;
+    return {
+        rate: signed(Math.round((req.speed - 1.0) * 100), "%"),
+        pitch: signed(Math.round(req.pitch), "Hz"),
+        volume: signed(Math.round(req.volume * 100), "%"),
+    };
+}
+
+// A line ending in "[500]" inserts a 500 ms pause there.
+function textToSsmlBody(text: string): string {
+    return escapeXml(text).replace(/\[(\d+)\][ \t]*$/gm, (_, ms) => `<break time="${Math.min(parseInt(ms), 20000)}ms"/>`);
+}
+
+async function getTranslatorAudioChunk(text: string, req: SpeechRequest): Promise<Uint8Array> {
     const endpoint = await getEndpoint();
-    const voice = OPENAI_VOICE_TO_EDGE[req.voice.toLowerCase()] || req.voice;
+    const voice = edgeVoiceName(req.voice);
     const outputFormat = req.model === "tts-1-hd" && req.response_format === "mp3" ? EDGE_HD_MP3 : EDGE_FORMATS[req.response_format]!;
 
     const response = await fetchWithTimeout(`https://${endpoint.r}.tts.speech.microsoft.com/cognitiveservices/v1`, {
@@ -459,19 +537,14 @@ async function getEdgeAudioChunk(text: string, req: SpeechRequest): Promise<Uint
 }
 
 function getSsml(text: string, voice: string, req: SpeechRequest): string {
-    const rate = Math.round((req.speed - 1.0) * 100);
-    const volume = Math.round(req.volume * 100);
-    const pitch = Math.round(req.pitch);
-    const signed = (n: number, unit: string) => `${n >= 0 ? "+" : ""}${n}${unit}`;
+    const { rate, pitch, volume } = edgeProsody(req);
     const lang = voice.split("-").slice(0, 2).join("-") || "en-US";
-
-    // A line ending in "[500]" inserts a 500 ms pause there.
-    const body = escapeXml(text).replace(/\[(\d+)\][ \t]*$/gm, (_, ms) => `<break time="${Math.min(parseInt(ms), 20000)}ms"/>`);
+    const body = textToSsmlBody(text);
 
     return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" version="1.0" xml:lang="${escapeXml(lang)}">
     <voice name="${escapeXml(voice)}">
         <mstts:express-as style="${req.style}" styledegree="2.0" role="default">
-            <prosody rate="${signed(rate, "%")}" pitch="${signed(pitch, "Hz")}" volume="${signed(volume, "%")}">${body}</prosody>
+            <prosody rate="${rate}" pitch="${pitch}" volume="${volume}">${body}</prosody>
         </mstts:express-as>
     </voice>
 </speak>`;
@@ -501,7 +574,7 @@ async function getEndpoint() {
             },
         });
         if (!response.ok) {
-            throw new Error(`Failed to get Edge TTS endpoint: ${response.status}`);
+            throw new Error(`HTTP ${response.status}`);
         }
 
         const data: any = await response.json();
@@ -524,6 +597,110 @@ async function sign(urlStr: string): Promise<string> {
     const key = base64ToBytes("oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==");
     const signature = await hmacSha256(key, bytesToSign);
     return `MSTranslatorAndroidApp::${bytesToBase64(signature)}::${formattedDate}::${uuidStr}`;
+}
+
+// ---------------------------------------------------------------- Edge Read Aloud (fallback)
+
+// Sec-MS-GEC: SHA-256 of the current Windows file time, rounded down to 5 minutes, plus the client token.
+async function readAloudSecMsGec(): Promise<string> {
+    let seconds = Math.floor(Date.now() / 1000) + 11644473600;
+    seconds -= seconds % 300;
+    const ticks = BigInt(seconds) * 10_000_000n;
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${ticks}${READALOUD_TOKEN}`));
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
+async function readAloudUrl(path: string, params: Record<string, string>): Promise<string> {
+    const query = new URLSearchParams({
+        ...params,
+        "Sec-MS-GEC": await readAloudSecMsGec(),
+        "Sec-MS-GEC-Version": `1-${READALOUD_CHROMIUM_VERSION}`,
+    });
+    return `https://${READALOUD_BASE}${path}?${query}`;
+}
+
+function readAloudTimestamp(): string {
+    return new Date().toUTCString().replace(/^(\w+), (\d+) (\w+) (\d+) (.+) GMT$/, "$1 $3 $2 $4 $5 GMT+0000 (Coordinated Universal Time)");
+}
+
+async function getReadAloudAudioChunk(text: string, req: SpeechRequest): Promise<Uint8Array> {
+    const parts: Uint8Array[] = [];
+    for (const piece of splitText(text, READALOUD_CHUNK_CHARS)) {
+        try {
+            parts.push(await readAloudSynthesize(piece, req));
+        } catch {
+            // The service intermittently closes without audio; one retry usually succeeds.
+            parts.push(await readAloudSynthesize(piece, req));
+        }
+    }
+    return concatBytes(parts);
+}
+
+async function readAloudSynthesize(text: string, req: SpeechRequest): Promise<Uint8Array> {
+    const voice = edgeVoiceName(req.voice);
+    const { rate, pitch, volume } = edgeProsody(req);
+    // The service only accepts the SSML shape Edge itself sends (one voice, one prosody, no <break>),
+    // so "[500]" pause markers are dropped here.
+    const body = escapeXml(text.replace(/\[\d+\][ \t]*$/gm, ""));
+    const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='${escapeXml(voice)}'><prosody pitch='${pitch}' rate='${rate}' volume='${volume}'>${body}</prosody></voice></speak>`;
+
+    const url = await readAloudUrl("/edge/v1", { TrustedClientToken: READALOUD_TOKEN, ConnectionId: uuid() });
+    const response = await fetchWithTimeout(url, {
+        headers: { ...READALOUD_HEADERS, Upgrade: "websocket", Cookie: `muid=${uuid().toUpperCase()};` },
+    });
+    const ws = response.webSocket;
+    if (!ws) {
+        throw new ApiError(502, `Edge Read Aloud connection failed: ${response.status} ${(await response.text()).slice(0, 300)}`, "server_error", null, "upstream_error");
+    }
+    ws.accept();
+
+    return new Promise<Uint8Array>((resolve, reject) => {
+        const parts: Uint8Array[] = [];
+        const fail = (message: string) => {
+            clearTimeout(timer);
+            try { ws.close(); } catch {}
+            reject(new ApiError(502, `Edge Read Aloud error: ${message}`, "server_error", null, "upstream_error"));
+        };
+        const timer = setTimeout(() => fail("timed out"), UPSTREAM_TIMEOUT_MS);
+
+        ws.addEventListener("message", (event) => {
+            if (typeof event.data === "string") {
+                if (/\r\nPath:turn\.end\r\n|^Path:turn\.end\r\n/.test(event.data)) {
+                    clearTimeout(timer);
+                    try { ws.close(); } catch {}
+                    if (parts.length === 0) return fail("no audio received (check the voice name)");
+                    resolve(concatBytes(parts));
+                }
+                return;
+            }
+            // Binary frame: 2-byte big-endian header length, headers, then audio.
+            const data = new Uint8Array(event.data as ArrayBuffer);
+            if (data.length < 2) return;
+            const headerLength = (data[0] << 8) | data[1];
+            const headers = new TextDecoder().decode(data.subarray(2, 2 + headerLength));
+            if (/(^|\r\n)Path:audio(\r\n|$)/.test(headers) && data.length > 2 + headerLength) {
+                parts.push(data.slice(2 + headerLength));
+            }
+        });
+        ws.addEventListener("close", () => fail(`connection closed before the audio finished (is '${voice}' a valid voice? See GET /v1/audio/voices)`));
+        ws.addEventListener("error", () => fail("connection error"));
+
+        const ts = readAloudTimestamp();
+        ws.send(
+            `X-Timestamp:${ts}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
+                `{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"${READALOUD_FORMAT}"}}}}\r\n`,
+        );
+        ws.send(`X-RequestId:${uuid()}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${ts}Z\r\nPath:ssml\r\n\r\n${ssml}`);
+    });
+}
+
+async function getReadAloudVoices(): Promise<any[]> {
+    const url = await readAloudUrl("/voices/list", { trustedclienttoken: READALOUD_TOKEN });
+    const response = await fetchWithTimeout(url, { headers: { ...READALOUD_HEADERS, Accept: "*/*" } });
+    if (!response.ok) {
+        throw new ApiError(502, `Edge Read Aloud voice list error: ${response.status}`, "server_error", null, "upstream_error");
+    }
+    return response.json();
 }
 
 // ---------------------------------------------------------------- openai.fm backend

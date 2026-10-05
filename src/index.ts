@@ -14,15 +14,21 @@
 // endpoint (primary: every output format and speaking styles) and the Edge browser's
 // Read Aloud WebSocket (fallback: mp3 only, no styles). EDGE_ENDPOINT selects
 // "auto" (default: translator, then read aloud on failure), "translator" or "readaloud".
+//
+// Optional: KOKORO_URL points at the Kokoro Space in hf-space/ (e.g. https://user-kokoro.hf.space),
+// with KOKORO_API_KEY if that Space has an API_KEY secret. Requests with model "kokoro" or a
+// Kokoro voice name (af_heart, zf_xiaoxiao, zf_001, ...) are then forwarded to it.
 
 export interface Env {
     API_KEY?: string;
     EDGE_ENDPOINT?: string;
+    KOKORO_URL?: string;
+    KOKORO_API_KEY?: string;
 }
 
 type EdgeEndpoint = "auto" | "translator" | "readaloud";
 
-type Provider = "edge" | "openai-fm";
+type Provider = "edge" | "openai-fm" | "kokoro";
 type ResponseFormat = "mp3" | "opus" | "aac" | "flac" | "wav" | "pcm";
 
 interface SpeechRequest {
@@ -35,6 +41,7 @@ interface SpeechRequest {
     speed: number;
     stream_format: "audio" | "sse";
     edgeEndpoint: EdgeEndpoint;
+    kokoro: { url: string; key?: string } | null;
     // Edge-only extensions, kept for the web UI and existing callers
     volume: number;
     pitch: number;
@@ -47,6 +54,11 @@ type ChunkSynthesizer = (text: string, req: SpeechRequest) => Promise<Uint8Array
 const MAX_INPUT_CHARS = 50_000;
 const EDGE_CHUNK_CHARS = 2000;
 const OPENAI_FM_CHUNK_CHARS = 900;
+// Small pieces get the first audio back sooner from a CPU-only Space.
+const KOKORO_CHUNK_CHARS = 300;
+// Kokoro voice ids: language letter, gender letter, name (af_heart, zf_xiaoxiao, zm_100, ...).
+// Edge voice names never contain an underscore.
+const KOKORO_VOICE_RE = /^[abefhijpz][fm]_[a-z0-9]+$/;
 const SYNTHESIS_CONCURRENCY = 3;
 const TOKEN_REFRESH_BEFORE_EXPIRY = 3 * 60;
 const UPSTREAM_TIMEOUT_MS = 30_000;
@@ -76,7 +88,9 @@ const MODELS: Record<string, Provider> = {
     "edge-tts": "edge",
     "gpt-4o-mini-tts": "openai-fm",
     "openai-fm": "openai-fm",
+    kokoro: "kokoro",
 };
+const MODEL_OWNERS: Record<Provider, string> = { edge: "microsoft-edge-tts", "openai-fm": "openai-fm", kokoro: "hexgrad" };
 const MODEL_CREATED = 1699046015;
 
 // OpenAI voice names -> Edge voices. The multilingual ones also read Chinese and other languages.
@@ -227,7 +241,7 @@ function parseEdgeEndpoint(env: Env): EdgeEndpoint {
 }
 
 function modelObject(id: string) {
-    return { id, object: "model", created: MODEL_CREATED, owned_by: MODELS[id] === "edge" ? "microsoft-edge-tts" : "openai-fm" };
+    return { id, object: "model", created: MODEL_CREATED, owned_by: MODEL_OWNERS[MODELS[id]] };
 }
 
 async function handleRetrieveModel(id: string): Promise<Response> {
@@ -243,6 +257,12 @@ async function handleListVoices(request: Request, env: Env): Promise<Response> {
     const model = params.get("model") || "tts-1";
     const locale = params.get("locale")?.toLowerCase();
 
+    if (MODELS[model] === "kokoro") {
+        const kokoro = kokoroConfig(env);
+        const response = await fetchWithTimeout(`${kokoro.url}/v1/audio/voices?${params}`, { headers: kokoroHeaders(kokoro) }, KOKORO_TIMEOUT_MS);
+        if (!response.ok) await throwKokoroError(response);
+        return jsonResponse(await response.json());
+    }
     if (MODELS[model] === "openai-fm") {
         return jsonResponse({ object: "list", data: OPENAI_VOICES.map((id) => ({ id, object: "voice", name: id })) });
     }
@@ -292,9 +312,15 @@ async function getEdgeVoices(edgeEndpoint: EdgeEndpoint): Promise<any[]> {
 async function handleSpeech(request: Request, env: Env, forcedProvider: Provider | null): Promise<Response> {
     const req = await parseSpeechRequest(request, forcedProvider);
     req.edgeEndpoint = parseEdgeEndpoint(env);
+    if (req.provider === "kokoro") req.kokoro = kokoroConfig(env);
 
-    const synthesize: ChunkSynthesizer = req.provider === "openai-fm" ? getOpenaiFmAudioChunk : getEdgeAudioChunk;
-    const maxChunk = req.provider === "openai-fm" ? OPENAI_FM_CHUNK_CHARS : EDGE_CHUNK_CHARS;
+    const synthesizers: Record<Provider, [ChunkSynthesizer, number]> = {
+        edge: [getEdgeAudioChunk, EDGE_CHUNK_CHARS],
+        "openai-fm": [getOpenaiFmAudioChunk, OPENAI_FM_CHUNK_CHARS],
+        // FLAC streams can't be concatenated, so FLAC is synthesized in one piece.
+        kokoro: [getKokoroAudioChunk, req.response_format === "flac" ? MAX_INPUT_CHARS : KOKORO_CHUNK_CHARS],
+    };
+    const [synthesize, maxChunk] = synthesizers[req.provider];
     const chunks = splitText(req.input, maxChunk);
 
     // Synthesize the first chunk before responding, so upstream failures still produce a proper error status.
@@ -369,7 +395,9 @@ async function parseSpeechRequest(request: Request, forcedProvider: Provider | n
         throw new ApiError(400, "'model' must be a string.", "invalid_request_error", "model");
     }
     // Unknown model names fall back to Edge, since many clients hard-code their own.
-    const provider: Provider = forcedProvider ?? MODELS[model] ?? "edge";
+    // A Kokoro voice name selects Kokoro whatever the model.
+    const isKokoroVoice = typeof body.voice === "string" && KOKORO_VOICE_RE.test(body.voice.trim());
+    const provider: Provider = forcedProvider ?? (isKokoroVoice ? "kokoro" : MODELS[model] ?? "edge");
 
     const input = body.input;
     if (typeof input !== "string" || !input.trim()) {
@@ -390,6 +418,9 @@ async function parseSpeechRequest(request: Request, forcedProvider: Provider | n
     const response_format = (body.response_format ?? "mp3") as ResponseFormat;
     if (!(response_format in CONTENT_TYPES)) {
         throw new ApiError(400, `Invalid value for 'response_format': '${response_format}'. Supported values are: 'mp3', 'opus', 'wav' and 'pcm'.`, "invalid_request_error", "response_format", "invalid_value");
+    }
+    if (provider === "kokoro" && response_format === "aac") {
+        throw new ApiError(400, "response_format 'aac' is not supported by Kokoro. Use 'mp3', 'opus', 'flac', 'wav' or 'pcm'.", "invalid_request_error", "response_format", "unsupported_value");
     }
     if (provider === "edge" && !EDGE_FORMATS[response_format]) {
         throw new ApiError(400, `response_format '${response_format}' is not supported by this server. Use 'mp3', 'opus', 'wav' or 'pcm'.`, "invalid_request_error", "response_format", "unsupported_value");
@@ -420,7 +451,7 @@ async function parseSpeechRequest(request: Request, forcedProvider: Provider | n
     }
     const style = typeof body.style === "string" && /^[\w-]+$/.test(body.style) ? body.style : "general";
 
-    return { model, provider, input, voice: voice.trim(), instructions, response_format, speed, stream_format, edgeEndpoint: "auto", volume, pitch, style };
+    return { model, provider, input, voice: voice.trim(), instructions, response_format, speed, stream_format, edgeEndpoint: "auto", kokoro: null, volume, pitch, style };
 }
 
 // Server-sent events in the shape of OpenAI's `stream_format: "sse"`.
@@ -701,6 +732,59 @@ async function getReadAloudVoices(): Promise<any[]> {
         throw new ApiError(502, `Edge Read Aloud voice list error: ${response.status}`, "server_error", null, "upstream_error");
     }
     return response.json();
+}
+
+// ---------------------------------------------------------------- Kokoro backend (Hugging Face Space)
+
+// A sleeping Space takes a minute or two to wake up, so allow more time than other upstreams.
+const KOKORO_TIMEOUT_MS = 180_000;
+
+function kokoroConfig(env: Env): { url: string; key?: string } {
+    const url = env.KOKORO_URL?.trim().replace(/\/+$/, "");
+    if (!url) {
+        throw new ApiError(400, "The Kokoro backend is not configured on this server (set KOKORO_URL).", "invalid_request_error", "model", "model_not_available");
+    }
+    return { url, key: env.KOKORO_API_KEY?.trim() || undefined };
+}
+
+function kokoroHeaders(kokoro: { key?: string }): Record<string, string> {
+    return { "Content-Type": "application/json", ...(kokoro.key ? { Authorization: `Bearer ${kokoro.key}` } : {}) };
+}
+
+async function throwKokoroError(response: Response): Promise<never> {
+    const text = await response.text();
+    let error: any = null;
+    try {
+        error = JSON.parse(text).error;
+    } catch {}
+    if (error?.message && response.status < 500 && response.status !== 401) {
+        // The Space's own validation errors are already in OpenAI format; pass them on.
+        throw new ApiError(response.status, error.message, error.type, error.param, error.code);
+    }
+    const status = response.status === 503 ? 503 : 502;
+    throw new ApiError(status, `Kokoro Space error: ${response.status} ${(error?.message ?? text).slice(0, 300)}`, "server_error", null, "upstream_error");
+}
+
+async function getKokoroAudioChunk(text: string, req: SpeechRequest): Promise<Uint8Array> {
+    const kokoro = req.kokoro!;
+    const response = await fetchWithTimeout(
+        `${kokoro.url}/v1/audio/speech`,
+        {
+            method: "POST",
+            headers: kokoroHeaders(kokoro),
+            body: JSON.stringify({
+                model: "kokoro",
+                input: text,
+                voice: req.voice,
+                // WAV is assembled from raw PCM here, like the Edge path
+                response_format: req.response_format === "wav" ? "pcm" : req.response_format,
+                speed: req.speed,
+            }),
+        },
+        KOKORO_TIMEOUT_MS,
+    );
+    if (!response.ok) await throwKokoroError(response);
+    return new Uint8Array(await response.arrayBuffer());
 }
 
 // ---------------------------------------------------------------- openai.fm backend

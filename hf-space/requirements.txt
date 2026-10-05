@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+kokoro==0.9.4
+misaki[zh]==0.9.4
+soundfile==0.14.0
+fastapi==0.142.2
+uvicorn==0.54.0
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

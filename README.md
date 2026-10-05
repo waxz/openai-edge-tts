@@ -50,7 +50,7 @@ const response = await fetch('部署到cloudflare后的网址', {
 `POST /v1/audio/speech` 参数：
 
 - `input`（必填）：要合成的文本，最长 50000 字符，超长会自动分段并发合成。行尾写 `[500]` 表示停顿 500ms。
-- `model`：`tts-1` / `edge-tts`（Edge TTS），`tts-1-hd`（Edge TTS，mp3 为 48kHz 192kbps），`gpt-4o-mini-tts` / `openai-fm`（openai.fm）。未知模型名按 Edge 处理。
+- `model`：`kokoro`（Hugging Face Space，见下文），`tts-1` / `edge-tts`（Edge TTS），`tts-1-hd`（Edge TTS，mp3 为 48kHz 192kbps），`gpt-4o-mini-tts` / `openai-fm`（openai.fm）。未知模型名按 Edge 处理。
 - `voice`：Edge 音色名（如 `zh-CN-XiaoxiaoNeural`），或 OpenAI 音色名 `alloy`、`ash`、`ballad`、`coral`、`echo`、`fable`、`onyx`、`nova`、`sage`、`shimmer`、`verse`、`marin`、`cedar`（映射到 Edge 的英文/多语言音色）。
 - `response_format`：`mp3`（默认）、`opus`、`wav`、`pcm`（24kHz 16bit 单声道，与 OpenAI 一致）。Edge 不支持 `aac`、`flac`。
 - `speed`：0.25–4.0。
@@ -80,6 +80,20 @@ npx wrangler deploy
 | Edge 浏览器“大声朗读” WebSocket（备用） | 仅 mp3 | 不支持（被服务端拒绝） | 忽略 | 约 320 |
 
 默认 `auto`：先走主接口，失败（5xx/网络错误）时 mp3 请求自动改走备用接口。可用环境变量 `EDGE_ENDPOINT` 固定为 `translator` 或 `readaloud`（在 `wrangler.toml` 的 `[vars]` 或控制台里设置）。
+
+### 可选：Kokoro 开源模型（部署在 Hugging Face 免费 Space）
+
+`hf-space/` 目录是一个兼容 OpenAI 的 [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) 服务（Apache-2.0，免费 CPU Space 即可运行），共 157 个音色，其中中文 108 个（`zf_xiaoxiao`、`zm_yunxi`，以及 v1.1-zh 的 `zf_001` … `zm_100`）。
+
+1. 在 https://huggingface.co/new-space 新建 Space，SDK 选 **Docker**，硬件选免费的 **CPU basic**。
+2. 上传 `hf-space/` 里的 4 个文件：`huggingface-cli upload <用户名>/<space名> hf-space . --repo-type=space`
+3. （可选）Space 设置里添加 Secret `API_KEY`。
+4. Worker 中设置 `KOKORO_URL=https://<用户名>-<space名>.hf.space`（有 key 时再设置 `KOKORO_API_KEY`）。
+
+之后 `model: "kokoro"`，或直接使用 Kokoro 音色名（如 `"voice": "zf_xiaoxiao"`），就会转发到 Space；`GET /v1/audio/voices?model=kokoro` 列出其音色。
+
+注意：免费 Space 48 小时无访问会休眠，唤醒需 1–2 分钟；2 核 CPU 合成速度约为实时的 1–1.5 倍，适合短文本或备用，长文本仍推荐 Edge。
+
 
 > 注意：openai.fm 是 OpenAI 的演示站，目前对程序化访问返回 Vercel 安全验证（429），该后端基本不可用。
 

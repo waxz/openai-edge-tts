@@ -81,11 +81,11 @@ npx wrangler deploy
 
 默认 `auto`：先走主接口，失败（5xx/网络错误）时 mp3 请求自动改走备用接口。可用环境变量 `EDGE_ENDPOINT` 固定为 `translator` 或 `readaloud`（在 `wrangler.toml` 的 `[vars]` 或控制台里设置）。
 
-### 可选：Kokoro 开源模型（部署在 Hugging Face 免费 Space）
+### 可选：Kokoro 开源模型（部署在 Hugging Face Space）
 
-`hf-space/` 目录是一个兼容 OpenAI 的 [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) 服务（Apache-2.0，免费 CPU Space 即可运行），共 157 个音色，其中中文 108 个（`zf_xiaoxiao`、`zm_yunxi`，以及 v1.1-zh 的 `zf_001` … `zm_100`）。
+`hf-space/` 目录是一个兼容 OpenAI 的 [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) 服务（Apache-2.0，CPU 即可运行），共 157 个音色，其中中文 108 个（`zf_xiaoxiao`、`zm_yunxi`，以及 v1.1-zh 的 `zf_001` … `zm_100`）。
 
-1. 在 https://huggingface.co/new-space 新建 Space，SDK 选 **Docker**，硬件选免费的 **CPU basic**。
+1. 准备一个 Docker Space（CPU basic）。注意：Hugging Face 现在**新建** Docker/Gradio Space 需要 PRO 订阅；如果账号里已有 Docker Space，可以尝试更新复用它。
 2. 上传 `hf-space/` 里的 4 个文件：`huggingface-cli upload <用户名>/<space名> hf-space . --repo-type=space`
 3. （可选）Space 设置里添加 Secret `API_KEY`。
 4. Worker 中设置 `KOKORO_URL=https://<用户名>-<space名>.hf.space`（有 key 时再设置 `KOKORO_API_KEY`）。

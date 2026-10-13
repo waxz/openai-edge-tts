@@ -22,6 +22,9 @@ Environment:
     YTDLP_COOKIES     path to a Netscape cookies.txt for YouTube
     YTDLP_COOKIES_TEXT  the cookies.txt contents instead of a path (for hosts whose secrets are text)
     YTDLP_EXTRA_ARGS  extra yt-dlp arguments, e.g. "--js-runtimes node"
+    YTDLP_MIN_INTERVAL  seconds between yt-dlp runs (default 20); runs never overlap
+    RATE_LIMIT_COOLDOWN  seconds to stop contacting YouTube after a 429 / bot check (default 900,
+                      doubling on each repeat up to 6 hours, reset by a successful download)
     TRANSCRIPTS       "auto" (default: on when whisper_stt.py and faster-whisper are installed), "on" or "off".
                       Each downloaded episode is transcribed in the background; once ready, the feed links
                       the transcript with <podcast:transcript>, which many podcast apps display.
@@ -58,6 +61,11 @@ YTDLP_EXTRA_ARGS = shlex.split(os.environ.get("YTDLP_EXTRA_ARGS", ""))
 
 FEED_TTL = 15 * 60
 DOWNLOAD_TIMEOUT = 30 * 60
+YTDLP_MIN_INTERVAL = float(os.environ.get("YTDLP_MIN_INTERVAL", "20"))
+RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "900"))
+MAX_COOLDOWN = 6 * 3600
+FAILED_VIDEO_TTL = 3600
+RATE_LIMIT_MARKERS = ("429", "too many requests", "not a bot", "sign in to confirm", "rate-limit", "rate limit")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 NS = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015", "media": "http://search.yahoo.com/mrss/"}
 ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
@@ -90,6 +98,44 @@ _feed_cache: dict[str, tuple[float, dict]] = {}
 _channel_cache: dict[str, dict] = {}
 _download_locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
+
+
+class RateLimited(Exception):
+    """YouTube is rate limiting this server; retry after `retry_after` seconds."""
+
+    def __init__(self, retry_after: int, message: str):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+# YouTube answers bursts from one IP with HTTP 429 and bot checks, and every retry extends the
+# block. So yt-dlp runs one at a time with a gap between runs, a rate-limit error pauses all
+# downloads for a growing cool-down, and videos that failed for other reasons aren't retried
+# on every feed refresh.
+_ytdlp_lock = threading.Lock()
+_rate = {"last_run": 0.0, "cooldown_until": 0.0, "cooldown": 0, "last_error": None}
+_failed_videos: dict[str, tuple[float, str]] = {}
+
+
+def _duration_text(seconds: float) -> str:
+    seconds = int(seconds + 0.999)
+    return f"{seconds} seconds" if seconds < 120 else f"{(seconds + 59) // 60} minutes"
+
+
+def _check_rate_limit():
+    remaining = _rate["cooldown_until"] - time.time()
+    if remaining > 0:
+        raise RateLimited(int(remaining) + 1, f"YouTube rate-limited this server; downloads paused for {_duration_text(remaining)} more. Last error: {_rate['last_error']}")
+
+
+def _record_failure(video_id: str, error: str):
+    if any(m in error.lower() for m in RATE_LIMIT_MARKERS):
+        _rate["cooldown"] = min(_rate["cooldown"] * 2, MAX_COOLDOWN) if _rate["cooldown"] else RATE_LIMIT_COOLDOWN
+        _rate["cooldown_until"] = time.time() + _rate["cooldown"]
+        _rate["last_error"] = error
+        print(f"rate limited by YouTube; pausing downloads for {_duration_text(_rate['cooldown'])}: {error}", flush=True)
+        raise RateLimited(_rate["cooldown"], f"YouTube rate-limited this server; downloads paused for {_duration_text(_rate['cooldown'])}. {error}")
+    _failed_videos[video_id] = (time.time(), error)
 
 app = FastAPI(title="YouTube to Podcast", docs_url=None, redoc_url=None)
 
@@ -212,6 +258,9 @@ def download_audio(video_id: str) -> Path:
     with lock:
         if path.exists():
             return path
+        if (failed := _failed_videos.get(video_id)) and time.time() - failed[0] < FAILED_VIDEO_TTL:
+            raise RuntimeError(f"{failed[1]} (not retried until {FAILED_VIDEO_TTL // 60} minutes after the failure)")
+        _check_rate_limit()
         tmp = CACHE_DIR / f"{video_id}.part"
         cmd = [
             "yt-dlp", "--no-playlist", "--no-progress", "--no-simulate",
@@ -219,17 +268,30 @@ def download_audio(video_id: str) -> Path:
             "--extract-audio", "--audio-format", "m4a",
             "-o", str(tmp / "audio.%(ext)s"),
             "--print", "after_move:%(duration)s",
+            # Fewer, slower requests: don't retry extraction on errors, pause between page requests.
+            "--extractor-retries", "0", "--sleep-requests", "1",
             *(["--cookies", YTDLP_COOKIES] if YTDLP_COOKIES else []),
             *YTDLP_EXTRA_ARGS,
             f"https://www.youtube.com/watch?v={video_id}",
         ]
-        started = time.time()
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT)
+            with _ytdlp_lock:
+                _check_rate_limit()  # another download may have hit the limit while we waited
+                if (wait := _rate["last_run"] + YTDLP_MIN_INTERVAL - time.time()) > 0:
+                    time.sleep(wait)
+                started = time.time()
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT)
+                finally:
+                    _rate["last_run"] = time.time()
             out = tmp / "audio.m4a"
             if result.returncode != 0 or not out.exists():
                 error = next((l for l in reversed(result.stderr.splitlines()) if l.startswith("ERROR")), result.stderr[-500:])
-                raise RuntimeError(error.strip() or "yt-dlp failed")
+                error = error.strip() or "yt-dlp failed"
+                _record_failure(video_id, error)
+                raise RuntimeError(error)
+            _rate["cooldown"] = 0  # YouTube is answering again
+            _failed_videos.pop(video_id, None)
             duration = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
             (CACHE_DIR / f"{video_id}.json").write_text(json.dumps({"duration": int(float(duration)) if duration not in ("", "NA") else None}))
             out.replace(path)
@@ -306,6 +368,8 @@ def prefetch(video_ids: list[str]):
                 if not audio_path(vid).exists():
                     download_audio(vid)
                 request_transcript(vid)
+            except RateLimited:
+                return  # don't queue more requests while YouTube is refusing them
             except Exception as e:
                 print(f"prefetch {vid} failed: {e}", flush=True)
     threading.Thread(target=run, daemon=True).start()
@@ -388,6 +452,20 @@ document.getElementById('o').innerHTML='<p>Feed URL:</p><code>'+u.replace(/&/g,'
 <input name="u" placeholder="https://www.youtube.com/@channel or ...playlist?list=PL..." required></form><div id="o"></div></body></html>"""
 
 
+@app.get("/status")
+def status(request: Request):
+    check_key(request)
+    remaining = max(0, int(_rate["cooldown_until"] - time.time()))
+    return {
+        "downloads_paused_seconds": remaining,
+        "last_rate_limit_error": _rate["last_error"] if remaining else None,
+        "failed_videos": {vid: err for vid, (at, err) in _failed_videos.items() if time.time() - at < FAILED_VIDEO_TTL},
+        "cached_episodes": len(list(CACHE_DIR.glob("*.m4a"))),
+        "transcripts_pending": len(_transcribe_pending),
+        "cookies": bool(YTDLP_COOKIES),
+    }
+
+
 @app.get("/feed")
 def feed_from_url(request: Request, url: str):
     check_key(request)
@@ -414,6 +492,9 @@ def audio(request: Request, video_id: str):
         raise HTTPException(404, "Unknown video id")
     try:
         path = download_audio(video_id)
+    except RateLimited as e:
+        hint = "" if YTDLP_COOKIES else " Setting YTDLP_COOKIES_TEXT (see README) usually helps on cloud hosts."
+        raise HTTPException(503, f"{e}{hint}", headers={"Retry-After": str(e.retry_after)})
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "Downloading the audio from YouTube timed out")
     except RuntimeError as e:

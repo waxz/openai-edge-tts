@@ -57,7 +57,22 @@ python podcast.py          # listens on port 7860
 | `YTDLP_COOKIES` | none | Path to a YouTube `cookies.txt` |
 | `YTDLP_COOKIES_TEXT` | none | The `cookies.txt` contents, for hosts whose secrets are text |
 | `YTDLP_EXTRA_ARGS` | none | Extra yt-dlp arguments, e.g. `--js-runtimes node` |
+| `YTDLP_MIN_INTERVAL` | `20` | Seconds between yt-dlp runs; downloads never run in parallel |
+| `RATE_LIMIT_COOLDOWN` | `900` | After a 429 or bot check, stop contacting YouTube this many seconds (doubles on each repeat, up to 6 hours) |
 | `TRANSCRIPTS` | `auto` | `auto` transcribes when Whisper is installed; `on` requires it; `off` disables |
+
+## Rate limits
+
+YouTube answers too many requests from one IP with `HTTP Error 429: Too Many Requests` or a bot
+check, and each retry extends the block. So the server downloads one episode at a time with a
+pause between downloads, and after a rate-limit error it stops contacting YouTube for 15 minutes
+(30, 60, ... up to 6 hours if it happens again). During that pause podcast apps get
+`503 Service Unavailable` with a `Retry-After` header and retry later on their own. Videos that
+fail for other reasons (private, removed) are not retried for an hour. `/status` shows the pause
+and recent errors.
+
+If 429s keep coming back: add cookies (below), lower `PREFETCH` to `1` or `0`, or raise
+`YTDLP_MIN_INTERVAL`.
 
 ## Where to host it
 

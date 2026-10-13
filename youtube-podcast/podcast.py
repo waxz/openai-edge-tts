@@ -3,7 +3,8 @@
 Runs on its own (`python podcast.py`) or as a module mounted into a larger FastAPI app
 (`root.mount("/podcast", podcast.app)`); every link it generates respects the mount path.
 
-    GET /                         small page that builds a feed URL from a YouTube link
+    GET /                         web page: enter the key and a YouTube link to get a feed URL
+    GET /api/feed-url?url=&key=   what the page calls; returns a signed feed URL
     GET /feed/{source}            podcast RSS; source is a channel id (UC...), @handle or playlist id (PL...)
     GET /feed?url=<youtube url>   redirects to /feed/{source}
     GET /audio/{video_id}.m4a     the episode audio, downloaded with yt-dlp on first request and cached
@@ -15,8 +16,10 @@ datacenter IPs; set YTDLP_COOKIES to a cookies.txt export if that happens.
 
 Environment:
     BASE_URL          public URL of this server, used in feed links (default: from the request)
-    ACCESS_KEY        if set, feeds and audio need ?key=<key>; comma-separate several keys. Feed links carry
-                      the key the feed was requested with, so podcast apps just work
+    ACCESS_KEY        if set, only the web page (and /status) needs the key; comma-separate several keys.
+                      The page hands out feed URLs signed for one channel (?sig=...), and feeds sign their
+                      audio and transcript links, so podcast apps never see the key and the server can't
+                      be used to download arbitrary videos. ?key=<key> is still accepted everywhere.
     CACHE_DIR         where audio is stored (default ./cache)
     CACHE_MAX_GB      oldest audio is deleted above this size (default 5)
     PREFETCH          newest episodes to download in the background when a feed is read (default 2)
@@ -31,6 +34,8 @@ Environment:
                       the transcript with <podcast:transcript>, which many podcast apps display.
 """
 
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -378,9 +383,36 @@ def prefetch(video_ids: list[str]):
 
 # ---------------------------------------------------------------- RSS
 
+def _signature(key: str, value: str) -> str:
+    return hmac.new(key.encode(), value.encode(), hashlib.sha256).hexdigest()[:24]
+
+
+def sign(value: str) -> str:
+    """Signature for a feed ("feed:<source>") or episode ("episode:<video id>") link."""
+    return _signature(ACCESS_KEYS[0], value) if ACCESS_KEYS else ""
+
+
 def check_key(request: Request):
     if ACCESS_KEYS and request.query_params.get("key", "").strip() not in ACCESS_KEYS:
         raise HTTPException(401, "Missing or wrong ?key=")
+
+
+def check_access(request: Request, signed_value: str):
+    """Allow a valid ?key= or a ?sig= made for this exact feed or episode (by any configured key)."""
+    if not ACCESS_KEYS or request.query_params.get("key", "").strip() in ACCESS_KEYS:
+        return
+    sig = request.query_params.get("sig", "")
+    if not any(hmac.compare_digest(sig, _signature(k, signed_value)) for k in ACCESS_KEYS):
+        raise HTTPException(401, "This link has no valid signature. Create the feed URL on this server's podcast page.")
+
+
+def episode_query(video_id: str) -> str:
+    return f"?sig={sign('episode:' + video_id)}" if ACCESS_KEYS else ""
+
+
+def signed_feed_url(base: str, ident: str, shorts: bool = False) -> str:
+    params = {**({"sig": sign("feed:" + ident)} if ACCESS_KEYS else {}), **({"shorts": "true"} if shorts else {})}
+    return f"{base}/feed/{urllib.parse.quote(ident)}" + (f"?{urllib.parse.urlencode(params)}" if params else "")
 
 
 def base_url(request: Request) -> str:
@@ -392,8 +424,7 @@ def base_url(request: Request) -> str:
     return f"{proto}://{request.headers.get('host', request.url.netloc)}{root_path}"
 
 
-def build_rss(feed: dict, base: str, include_shorts: bool, key: str = "") -> bytes:
-    key_query = f"?key={urllib.parse.quote(key)}" if key else ""
+def build_rss(feed: dict, base: str, include_shorts: bool) -> bytes:
     rss = ET.Element("rss", {"version": "2.0"})
     ch = ET.SubElement(rss, "channel")
 
@@ -427,14 +458,14 @@ def build_rss(feed: dict, base: str, include_shorts: bool, key: str = "") -> byt
         sub(item, "description", f"{ep['description']}\n\n{ep['link']}".strip())
         path = audio_path(ep["id"])
         size = str(path.stat().st_size) if path.exists() else "0"
-        sub(item, "enclosure", url=f"{base}/audio/{ep['id']}.m4a{key_query}", type="audio/mp4", length=size)
+        sub(item, "enclosure", url=f"{base}/audio/{ep['id']}.m4a{episode_query(ep['id'])}", type="audio/mp4", length=size)
         if ep["thumbnail"]:
             sub(item, f"{{{ITUNES}}}image", href=ep["thumbnail"])
         if duration := audio_meta(ep["id"]).get("duration"):
             sub(item, f"{{{ITUNES}}}duration", str(duration))
         if transcript := load_transcript(ep["id"]):
             for fmt in ("vtt", "srt"):
-                sub(item, f"{{{PODCAST_NS}}}transcript", url=f"{base}/transcript/{ep['id']}.{fmt}{key_query}",
+                sub(item, f"{{{PODCAST_NS}}}transcript", url=f"{base}/transcript/{ep['id']}.{fmt}{episode_query(ep['id'])}",
                     type=TRANSCRIPT_TYPES[fmt], language=transcript.get("language") or "en")
     return b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(rss, encoding="utf-8")
 
@@ -443,14 +474,52 @@ def build_rss(feed: dict, base: str, include_shorts: bool, key: str = "") -> byt
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YouTube to Podcast</title><style>body{font:16px system-ui;max-width:640px;margin:40px auto;padding:0 16px}
-input{width:100%;padding:8px;box-sizing:border-box}code{word-break:break-all}</style></head><body>
-<h1>YouTube to Podcast</h1><p>Paste a channel or playlist link, then add the feed URL to your podcast app.</p>
-<form onsubmit="event.preventDefault();var k=new URLSearchParams(location.search).get('key');
-var u=location.origin+location.pathname.replace(/\/?$/,'/')+'feed?url='+encodeURIComponent(this.u.value)+(k?'&key='+encodeURIComponent(k):'');
-document.getElementById('o').innerHTML='<p>Feed URL:</p><code>'+u.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</code>'">
-<input name="u" placeholder="https://www.youtube.com/@channel or ...playlist?list=PL..." required></form><div id="o"></div></body></html>"""
+    return INDEX_HTML.replace("__KEY_FIELD__", "" if ACCESS_KEYS else "hidden")
+
+
+INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YouTube to Podcast</title><style>
+body{font:16px/1.5 system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#1f2328;background:#fff}
+label{display:block;margin:12px 0 4px;font-weight:600}input{width:100%;padding:8px;box-sizing:border-box;font:inherit}
+button{margin-top:12px;padding:8px 16px;font:inherit;cursor:pointer}code{display:block;word-break:break-all;background:#f3f4f6;padding:8px;border-radius:6px}
+.err{color:#b42318}.hidden{display:none}
+@media (prefers-color-scheme:dark){body{background:#0d1117;color:#e6edf3}code{background:#161b22}.err{color:#ff7b72}}
+</style></head><body>
+<h1>YouTube to Podcast</h1>
+<p>Paste a YouTube channel or playlist link to get a podcast feed URL for your podcast app.</p>
+<form id="f">
+<div class="__KEY_FIELD__"><label for="k">API key</label><input id="k" type="password" autocomplete="current-password"></div>
+<label for="u">YouTube link</label><input id="u" placeholder="https://www.youtube.com/@channel or ...playlist?list=PL..." required>
+<label><input id="s" type="checkbox" style="width:auto"> Include Shorts</label>
+<button>Get feed URL</button></form>
+<div id="o" aria-live="polite"></div>
+<script>
+var k=document.getElementById('k'),o=document.getElementById('o');
+try{k.value=localStorage.getItem('podcastKey')||''}catch(e){}
+document.getElementById('f').onsubmit=async function(e){
+  e.preventDefault();o.textContent='Checking the channel...';
+  var q=new URLSearchParams({url:document.getElementById('u').value,key:k.value});
+  if(document.getElementById('s').checked)q.set('shorts','true');
+  try{
+    var r=await fetch(location.pathname.replace(/\/?$/,'/')+'api/feed-url?'+q),d=await r.json();
+    if(!r.ok)throw new Error(d.detail||r.status);
+    try{localStorage.setItem('podcastKey',k.value)}catch(e){}
+    o.innerHTML='';var p=document.createElement('p');p.textContent='Feed for '+d.title+' ('+d.episodes+' episodes):';
+    var c=document.createElement('code');c.textContent=d.feed_url;var b=document.createElement('button');b.textContent='Copy';
+    b.onclick=function(){navigator.clipboard.writeText(d.feed_url);b.textContent='Copied'};o.append(p,c,b);
+  }catch(err){o.innerHTML='';var p=document.createElement('p');p.className='err';p.textContent=err.message;o.append(p)}
+};
+</script></body></html>"""
+
+
+@app.get("/api/feed-url")
+def api_feed_url(request: Request, url: str, shorts: bool = False):
+    if ACCESS_KEYS and request.query_params.get("key", "").strip() not in ACCESS_KEYS:
+        raise HTTPException(401, "Wrong API key.")
+    kind, ident = parse_source(url)
+    data = load_feed(kind, ident)  # fails with a clear error if the channel or playlist doesn't exist
+    episodes = sum(1 for e in data["episodes"] if shorts or not e["short"])
+    return {"feed_url": signed_feed_url(base_url(request), ident, shorts), "title": data["title"], "episodes": episodes}
 
 
 @app.get("/status")
@@ -468,28 +537,25 @@ def status(request: Request):
 
 
 @app.get("/feed")
-def feed_from_url(request: Request, url: str):
+def feed_from_url(request: Request, url: str, shorts: bool = False):
     check_key(request)
     _, ident = parse_source(url)
-    query = urllib.parse.urlencode({k: v for k, v in request.query_params.items() if k != "url"})
-    root_path = request.scope.get("root_path", "").rstrip("/")
-    return RedirectResponse(f"{root_path}/feed/{urllib.parse.quote(ident)}" + (f"?{query}" if query else ""), status_code=302)
+    return RedirectResponse(signed_feed_url(base_url(request), ident, shorts), status_code=302)
 
 
 @app.get("/feed/{source}")
 def feed(request: Request, source: str, shorts: bool = False):
-    check_key(request)
     kind, ident = parse_source(source)
+    check_access(request, "feed:" + ident)
     data = load_feed(kind, ident)
     if PREFETCH > 0:
         prefetch([e["id"] for e in data["episodes"] if shorts or not e["short"]][:PREFETCH])
-    key = request.query_params.get("key", "").strip() if ACCESS_KEYS else ""
-    return Response(build_rss(data, base_url(request), shorts, key), media_type="application/rss+xml; charset=utf-8")
+    return Response(build_rss(data, base_url(request), shorts), media_type="application/rss+xml; charset=utf-8")
 
 
 @app.api_route("/audio/{video_id}.m4a", methods=["GET", "HEAD"])
 def audio(request: Request, video_id: str):
-    check_key(request)
+    check_access(request, "episode:" + video_id)
     if not VIDEO_ID_RE.match(video_id):
         raise HTTPException(404, "Unknown video id")
     try:
@@ -510,7 +576,7 @@ def audio(request: Request, video_id: str):
 
 @app.get("/transcript/{video_id}.{fmt}")
 def transcript(request: Request, video_id: str, fmt: str):
-    check_key(request)
+    check_access(request, "episode:" + video_id)
     if not VIDEO_ID_RE.match(video_id) or fmt not in TRANSCRIPT_TYPES:
         raise HTTPException(404, "Unknown transcript")
     if whisper_stt is None:

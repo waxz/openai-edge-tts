@@ -18,11 +18,12 @@ One Space running independent modules, each its own FastAPI app (`app.py` mounts
 |---|---|---|
 | `tts` | `kokoro_tts.py` | `/v1/audio/speech`, `/v1/models`, `/v1/audio/voices` |
 | `stt` | `whisper_stt.py` | `/v1/audio/transcriptions`, `/v1/audio/translations` |
-| `podcast` | `podcast.py` (from `youtube-podcast/`) | `/podcast/`, feeds at `/podcast/feed/@channel?key=<API_KEY>` |
+| `podcast` | `podcast.py` (from `youtube-podcast/`) | `/podcast/` page; it asks for `API_KEY` and gives signed feed URLs |
 
 Set `MODULES` (default `tts,stt,podcast`) to choose which load. `GET /` lists loaded and failed modules.
-The `API_KEY` secret protects both: TTS needs `Authorization: Bearer <key>`, podcast feeds need `?key=<key>`
-(or set a separate `ACCESS_KEY`). Podcast settings are described in `youtube-podcast/README.md`.
+The `API_KEY` secret protects every module: TTS and STT need `Authorization: Bearer <key>`; the podcast
+page asks for it and hands out feed URLs signed for one channel, so podcast apps never see the key
+(set a separate `ACCESS_KEY` to use a different key for the podcast page). Podcast settings are described in `youtube-podcast/README.md`.
 
 Episodes downloaded by the podcast module are transcribed with Whisper in the background; the feed
 then links each transcript with `<podcast:transcript>` (VTT and SRT), which AntennaPod, Pocket Casts,

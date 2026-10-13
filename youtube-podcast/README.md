@@ -50,7 +50,7 @@ python podcast.py          # listens on port 7860
 | Variable | Default | Meaning |
 |---|---|---|
 | `BASE_URL` | taken from the request | Public address used in feed links, e.g. `https://pod.example.com` |
-| `ACCESS_KEY` | none | Require `?key=...` on feeds and audio (comma-separate several keys). Feed links carry the key the feed was opened with, so podcast apps just work. |
+| `ACCESS_KEY` | none | Key for the web page (comma-separate several keys). See "Access" below. |
 | `CACHE_DIR` | `./cache` | Where audio is stored |
 | `CACHE_MAX_GB` | `5` | Oldest episodes are deleted above this size |
 | `PREFETCH` | `2` | Newest episodes to download in the background when a feed is read (0 = off) |
@@ -60,6 +60,18 @@ python podcast.py          # listens on port 7860
 | `YTDLP_MIN_INTERVAL` | `20` | Seconds between yt-dlp runs; downloads never run in parallel |
 | `RATE_LIMIT_COOLDOWN` | `900` | After a 429 or bot check, stop contacting YouTube this many seconds (doubles on each repeat, up to 6 hours) |
 | `TRANSCRIPTS` | `auto` | `auto` transcribes when Whisper is installed; `on` requires it; `off` disables |
+
+## Access
+
+With `ACCESS_KEY` set, only the web page needs the key. Enter it with a YouTube link and the page
+gives you a feed URL like `https://your-server/feed/@channel?sig=…`. The signature is valid for that
+one channel only, and the feed signs each episode's audio and transcript links the same way, so:
+
+- podcast apps never see your key, and links keep working after restarts;
+- nobody can use your server to make feeds for other channels or download arbitrary videos;
+- anyone who has one of your feed URLs can listen to that feed (treat it like a private link).
+
+Changing `ACCESS_KEY` invalidates the existing feed URLs. Links with `?key=<key>` keep working.
 
 ## Rate limits
 

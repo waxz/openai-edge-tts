@@ -17,6 +17,7 @@ Apple Podcasts, Pocket Casts, AntennaPod, Overcast or any other podcast app.
 - Episode lists come from YouTube's public feeds: the newest 15 videos, no API key needed. Shorts are left out unless you add `?shorts=true`.
 - Audio is downloaded with [yt-dlp](https://github.com/yt-dlp/yt-dlp) the first time an episode is played, saved as M4A (AAC), and served from a local cache with seeking support.
 - The newest episodes are downloaded in the background whenever a podcast app refreshes the feed, so they are ready to play.
+- Optional transcripts: when `whisper_stt.py` (from `hf-space/`) and `faster-whisper` are installed, each downloaded episode is transcribed in the background and the feed links it with `<podcast:transcript>`. The combined Space in `hf-space/` does this out of the box.
 
 ## Feed URLs
 
@@ -56,6 +57,7 @@ python podcast.py          # listens on port 7860
 | `YTDLP_COOKIES` | none | Path to a YouTube `cookies.txt` |
 | `YTDLP_COOKIES_TEXT` | none | The `cookies.txt` contents, for hosts whose secrets are text |
 | `YTDLP_EXTRA_ARGS` | none | Extra yt-dlp arguments, e.g. `--js-runtimes node` |
+| `TRANSCRIPTS` | `auto` | `auto` transcribes when Whisper is installed; `on` requires it; `off` disables |
 
 ## Where to host it
 

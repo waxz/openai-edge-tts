@@ -7,6 +7,7 @@ Runs on its own (`python podcast.py`) or as a module mounted into a larger FastA
     GET /feed/{source}            podcast RSS; source is a channel id (UC...), @handle or playlist id (PL...)
     GET /feed?url=<youtube url>   redirects to /feed/{source}
     GET /audio/{video_id}.m4a     the episode audio, downloaded with yt-dlp on first request and cached
+    GET /transcript/{video_id}.vtt  episode transcript (.vtt, .srt, .txt or .json), made with Whisper
 
 Episode lists come from YouTube's public Atom feeds (newest 15 videos), which need no API key
 and are rarely rate limited. Audio is fetched with yt-dlp, which YouTube may block from
@@ -21,11 +22,15 @@ Environment:
     YTDLP_COOKIES     path to a Netscape cookies.txt for YouTube
     YTDLP_COOKIES_TEXT  the cookies.txt contents instead of a path (for hosts whose secrets are text)
     YTDLP_EXTRA_ARGS  extra yt-dlp arguments, e.g. "--js-runtimes node"
+    TRANSCRIPTS       "auto" (default: on when whisper_stt.py and faster-whisper are installed), "on" or "off".
+                      Each downloaded episode is transcribed in the background; once ready, the feed links
+                      the transcript with <podcast:transcript>, which many podcast apps display.
 """
 
 import html
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -56,7 +61,21 @@ DOWNLOAD_TIMEOUT = 30 * 60
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 NS = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015", "media": "http://search.yahoo.com/mrss/"}
 ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
+PODCAST_NS = "https://podcastindex.org/namespace/1.0"
 ET.register_namespace("itunes", ITUNES)
+ET.register_namespace("podcast", PODCAST_NS)
+
+# Transcripts use the Whisper module from the same Space when it is installed.
+TRANSCRIPTS = os.environ.get("TRANSCRIPTS", "auto").lower()
+whisper_stt = None
+if TRANSCRIPTS != "off":
+    try:
+        import faster_whisper  # noqa: F401
+        import whisper_stt
+    except ImportError as e:
+        if TRANSCRIPTS == "on":
+            raise RuntimeError("TRANSCRIPTS=on needs whisper_stt.py and faster-whisper") from e
+TRANSCRIPT_TYPES = {"vtt": "text/vtt", "srt": "application/x-subrip", "txt": "text/plain", "json": "application/json"}
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
@@ -222,23 +241,73 @@ def download_audio(video_id: str) -> Path:
 
 
 def trim_cache():
+    """Delete the least recently played audio; metadata and transcripts are tiny and kept."""
     files = sorted(CACHE_DIR.glob("*.m4a"), key=lambda p: p.stat().st_mtime)
     total = sum(p.stat().st_size for p in files)
     while files and total > CACHE_MAX_BYTES:
         oldest = files.pop(0)
         total -= oldest.stat().st_size
         oldest.unlink(missing_ok=True)
-        (CACHE_DIR / f"{oldest.stem}.json").unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- transcripts
+
+def transcript_path(video_id: str) -> Path:
+    return CACHE_DIR / f"{video_id}.transcript.json"
+
+
+def load_transcript(video_id: str) -> dict | None:
+    try:
+        return json.loads(transcript_path(video_id).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+_transcribe_queue: "queue.Queue[str]" = queue.Queue()
+_transcribe_pending: set[str] = set()
+_transcribe_worker: threading.Thread | None = None
+
+
+def request_transcript(video_id: str):
+    """Queue a background transcription of downloaded audio (one at a time, oldest request first)."""
+    global _transcribe_worker
+    if whisper_stt is None or transcript_path(video_id).exists() or not audio_path(video_id).exists():
+        return
+    with _locks_guard:
+        if video_id in _transcribe_pending:
+            return
+        _transcribe_pending.add(video_id)
+        if _transcribe_worker is None:
+            _transcribe_worker = threading.Thread(target=_transcribe_loop, daemon=True)
+            _transcribe_worker.start()
+    _transcribe_queue.put(video_id)
+
+
+def _transcribe_loop():
+    while True:
+        video_id = _transcribe_queue.get()
+        try:
+            if audio_path(video_id).exists() and not transcript_path(video_id).exists():
+                result = whisper_stt.transcribe(str(audio_path(video_id)))
+                tmp = transcript_path(video_id).with_suffix(".tmp")
+                tmp.write_text(json.dumps(result, ensure_ascii=False))
+                tmp.replace(transcript_path(video_id))
+        except Exception as e:
+            print(f"transcript {video_id} failed: {e}", flush=True)
+        finally:
+            with _locks_guard:
+                _transcribe_pending.discard(video_id)
 
 
 def prefetch(video_ids: list[str]):
     def run():
         for vid in video_ids:
-            if not audio_path(vid).exists():
-                try:
+            try:
+                if not audio_path(vid).exists():
                     download_audio(vid)
-                except Exception as e:
-                    print(f"prefetch {vid} failed: {e}", flush=True)
+                request_transcript(vid)
+            except Exception as e:
+                print(f"prefetch {vid} failed: {e}", flush=True)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -298,6 +367,10 @@ def build_rss(feed: dict, base: str, include_shorts: bool) -> bytes:
             sub(item, f"{{{ITUNES}}}image", href=ep["thumbnail"])
         if duration := audio_meta(ep["id"]).get("duration"):
             sub(item, f"{{{ITUNES}}}duration", str(duration))
+        if transcript := load_transcript(ep["id"]):
+            for fmt in ("vtt", "srt"):
+                sub(item, f"{{{PODCAST_NS}}}transcript", url=f"{base}/transcript/{ep['id']}.{fmt}{key_query}",
+                    type=TRANSCRIPT_TYPES[fmt], language=transcript.get("language") or "en")
     return b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(rss, encoding="utf-8")
 
 
@@ -347,8 +420,27 @@ def audio(request: Request, video_id: str):
         hint = " YouTube is blocking this server; set YTDLP_COOKIES (see README)." if "bot" in str(e).lower() else ""
         raise HTTPException(502, f"{e}{hint}")
     os.utime(path)  # mark as recently used for cache eviction
+    request_transcript(video_id)
     # FileResponse answers Range requests, which podcast apps use to seek and resume.
     return FileResponse(path, media_type="audio/mp4", filename=f"{video_id}.m4a", content_disposition_type="inline")
+
+
+@app.get("/transcript/{video_id}.{fmt}")
+def transcript(request: Request, video_id: str, fmt: str):
+    check_key(request)
+    if not VIDEO_ID_RE.match(video_id) or fmt not in TRANSCRIPT_TYPES:
+        raise HTTPException(404, "Unknown transcript")
+    if whisper_stt is None:
+        raise HTTPException(404, "Transcripts are not enabled on this server")
+    result = load_transcript(video_id)
+    if result is None:
+        request_transcript(video_id)
+        status = "queued" if audio_path(video_id).exists() else "available after the episode audio has been downloaded"
+        raise HTTPException(404, f"Transcript not ready yet ({status})", headers={"Retry-After": "600"})
+    if fmt == "json":
+        return result
+    body = {"vtt": whisper_stt.to_vtt, "srt": whisper_stt.to_srt, "txt": lambda r: r["text"] + "\n"}[fmt](result)
+    return Response(body, media_type=f"{TRANSCRIPT_TYPES[fmt]}; charset=utf-8")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,10 @@ SAMPLE_RATE = 24000
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "10000"))
 API_KEYS = [k.strip() for k in os.environ.get("API_KEY", "").split(",") if k.strip()]
 
+# Paths this module serves when mounted at the root next to other modules (see app.py);
+# more specific paths claimed by other modules (e.g. /v1/audio/transcriptions) win.
+PATHS = ["/v1"]
+
 REPO_V1 = "hexgrad/Kokoro-82M"
 REPO_ZH = "hexgrad/Kokoro-82M-v1.1-zh"
 

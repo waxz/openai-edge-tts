@@ -19,8 +19,11 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 
 # Bake both models and all voices into the image so a waking Space doesn't download them.
 RUN python -c "from huggingface_hub import snapshot_download as d; d('hexgrad/Kokoro-82M'); d('hexgrad/Kokoro-82M-v1.1-zh')"
+# Same for the Whisper model (change both this and the WHISPER_MODEL variable to use another size)
+ARG WHISPER_MODEL=small
+RUN python -c "from faster_whisper import download_model; download_model('${WHISPER_MODEL}')"
 
-# app.py mounts the modules listed in MODULES: kokoro_tts.py (TTS) and podcast.py (YouTube podcasts)
+# app.py mounts the modules listed in MODULES: kokoro_tts.py (TTS), whisper_stt.py (STT), podcast.py (YouTube podcasts)
 COPY --chown=user *.py ./
 EXPOSE 7860
 # Refresh yt-dlp on every start so YouTube changes don't break podcast downloads; keep going if offline.

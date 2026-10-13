@@ -17,6 +17,7 @@ FILES = {
     "requirements.txt": HERE / "requirements.txt",
     "app.py": HERE / "app.py",
     "kokoro_tts.py": HERE / "kokoro_tts.py",
+    "whisper_stt.py": HERE / "whisper_stt.py",
     "podcast.py": HERE.parent / "youtube-podcast" / "podcast.py",
 }
 

@@ -29,9 +29,12 @@ Environment:
     YTDLP_MIN_INTERVAL  seconds between yt-dlp runs (default 20); runs never overlap
     RATE_LIMIT_COOLDOWN  seconds to stop contacting YouTube after a 429 / bot check (default 900,
                       doubling on each repeat up to 6 hours, reset by a successful download)
-    TRANSCRIPTS       "auto" (default: on when whisper_stt.py and faster-whisper are installed), "on" or "off".
-                      Each downloaded episode is transcribed in the background; once ready, the feed links
-                      the transcript with <podcast:transcript>, which many podcast apps display.
+    TRANSCRIPTS       "auto" (default), "on" or "off". Each downloaded episode is transcribed in the
+                      background; once ready, the feed links it with <podcast:transcript>, which many
+                      podcast apps display. Uses WHISPER_API_URL if set, else a local whisper_stt.py.
+    WHISPER_API_URL   an OpenAI-compatible speech-to-text server, e.g. https://<user>-<space>.hf.space
+                      (the Space in hf-space/). Episodes are sent in 10-minute pieces.
+    WHISPER_API_KEY   its API key (sent as a Bearer token)
 """
 
 import hashlib
@@ -80,16 +83,26 @@ PODCAST_NS = "https://podcastindex.org/namespace/1.0"
 ET.register_namespace("itunes", ITUNES)
 ET.register_namespace("podcast", PODCAST_NS)
 
-# Transcripts use the Whisper module from the same Space when it is installed.
+# Transcripts come from a remote OpenAI-compatible Whisper API (WHISPER_API_URL) or, when this
+# module runs inside the hf-space app, from the local whisper_stt module.
 TRANSCRIPTS = os.environ.get("TRANSCRIPTS", "auto").lower()
-whisper_stt = None
+WHISPER_API_URL = os.environ.get("WHISPER_API_URL", "").strip().rstrip("/")
+WHISPER_API_KEY = os.environ.get("WHISPER_API_KEY", "").strip()
+TRANSCRIBE_CHUNK_SECONDS = int(os.environ.get("TRANSCRIBE_CHUNK_SECONDS", "600"))
+TRANSCRIBE_RETRY_AFTER = 3600
+transcribe_audio = None  # (path) -> {language, duration, text, segments: [{start, end, text}]}
 if TRANSCRIPTS != "off":
-    try:
-        import faster_whisper  # noqa: F401
-        import whisper_stt
-    except ImportError as e:
-        if TRANSCRIPTS == "on":
-            raise RuntimeError("TRANSCRIPTS=on needs whisper_stt.py and faster-whisper") from e
+    if WHISPER_API_URL:
+        transcribe_audio = lambda path: transcribe_remote(path)  # defined further down
+    else:
+        try:
+            import faster_whisper  # noqa: F401
+            import whisper_stt
+
+            transcribe_audio = whisper_stt.transcribe
+        except ImportError as e:
+            if TRANSCRIPTS == "on":
+                raise RuntimeError("TRANSCRIPTS=on needs WHISPER_API_URL, or whisper_stt.py and faster-whisper") from e
 TRANSCRIPT_TYPES = {"vtt": "text/vtt", "srt": "application/x-subrip", "txt": "text/plain", "json": "application/json"}
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -361,14 +374,73 @@ def load_transcript(video_id: str) -> dict | None:
 
 _transcribe_queue: "queue.Queue[str]" = queue.Queue()
 _transcribe_pending: set[str] = set()
+_transcribe_failed: dict[str, float] = {}
 _transcribe_worker: threading.Thread | None = None
+
+
+def _timestamp(seconds: float, sep: str) -> str:
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
+
+
+def to_srt(result: dict) -> str:
+    return "".join(f"{i}\n{_timestamp(s['start'], ',')} --> {_timestamp(s['end'], ',')}\n{s['text']}\n\n" for i, s in enumerate(result["segments"], 1))
+
+
+def to_vtt(result: dict) -> str:
+    return "WEBVTT\n\n" + "".join(f"{_timestamp(s['start'], '.')} --> {_timestamp(s['end'], '.')}\n{s['text']}\n\n" for s in result["segments"])
+
+
+def _multipart(fields: dict[str, str], file_name: str, file_bytes: bytes) -> tuple[bytes, str]:
+    boundary = f"----podcast{os.urandom(8).hex()}"
+    parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields.items()]
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{file_name}"\r\nContent-Type: audio/mpeg\r\n\r\n'.encode() + file_bytes + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def transcribe_remote(path: str) -> dict:
+    """Transcribe with WHISPER_API_URL in TRANSCRIBE_CHUNK_SECONDS pieces of 16 kHz mono MP3, so each
+    upload is small (~2.5 MB per 10 minutes) and finishes well inside proxy time limits."""
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path], capture_output=True, text=True)
+    duration = float(probe.stdout.strip() or 0)
+    language, segments, texts = None, [], []
+    started = time.time()
+    for offset in range(0, max(int(duration), 1), TRANSCRIBE_CHUNK_SECONDS):
+        piece = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", str(offset), "-t", str(TRANSCRIBE_CHUNK_SECONDS), "-i", path,
+             "-ac", "1", "-ar", "16000", "-b:a", "32k", "-f", "mp3", "pipe:1"],
+            capture_output=True, check=True,
+        ).stdout
+        fields = {"model": "whisper-1", "response_format": "verbose_json", **({"language": language} if language else {})}
+        body, content_type = _multipart(fields, "audio.mp3", piece)
+        headers = {"Content-Type": content_type, **({"Authorization": f"Bearer {WHISPER_API_KEY}"} if WHISPER_API_KEY else {})}
+        req = urllib.request.Request(f"{WHISPER_API_URL}/v1/audio/transcriptions", data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=1800) as r:
+                result = json.load(r)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Whisper API returned {e.code}: {e.read()[:300].decode('utf-8', 'replace')}")
+        language = language or result.get("language")  # keep later pieces in the language of the first
+        for seg in result.get("segments") or [{"start": 0, "end": result.get("duration", 0), "text": result.get("text", "")}]:
+            if seg.get("text", "").strip():
+                segments.append({"id": len(segments), "start": round(seg["start"] + offset, 2), "end": round(seg["end"] + offset, 2), "text": seg["text"].strip()})
+        texts.append(result.get("text", "").strip())
+    print(f"transcribed {duration:.0f}s via {WHISPER_API_URL} in {time.time() - started:.0f}s", flush=True)
+    joiner = "" if language in ("zh", "ja", "yue", "chinese", "japanese") else " "
+    return {"language": language, "duration": round(duration, 2), "text": joiner.join(t for t in texts if t), "segments": segments}
 
 
 def request_transcript(video_id: str):
     """Queue a background transcription of downloaded audio (one at a time, oldest request first)."""
     global _transcribe_worker
-    if whisper_stt is None or transcript_path(video_id).exists() or not audio_path(video_id).exists():
+    if transcribe_audio is None or transcript_path(video_id).exists() or not audio_path(video_id).exists():
         return
+    if time.time() - _transcribe_failed.get(video_id, 0) < TRANSCRIBE_RETRY_AFTER:
+        return  # failed recently; don't resend the audio on every feed refresh
     with _locks_guard:
         if video_id in _transcribe_pending:
             return
@@ -384,11 +456,12 @@ def _transcribe_loop():
         video_id = _transcribe_queue.get()
         try:
             if audio_path(video_id).exists() and not transcript_path(video_id).exists():
-                result = whisper_stt.transcribe(str(audio_path(video_id)))
+                result = transcribe_audio(str(audio_path(video_id)))
                 tmp = transcript_path(video_id).with_suffix(".tmp")
                 tmp.write_text(json.dumps(result, ensure_ascii=False))
                 tmp.replace(transcript_path(video_id))
         except Exception as e:
+            _transcribe_failed[video_id] = time.time()
             print(f"transcript {video_id} failed: {e}", flush=True)
         finally:
             with _locks_guard:
@@ -597,6 +670,7 @@ def status(request: Request):
         "cached_episodes": len(list(CACHE_DIR.glob("*.m4a"))),
         "transcripts_pending": len(_transcribe_pending),
         "cookies": bool(YTDLP_COOKIES),
+        "transcripts": ("remote " + WHISPER_API_URL) if WHISPER_API_URL and transcribe_audio else ("local" if transcribe_audio else "off"),
     }
 
 
@@ -643,16 +717,21 @@ def transcript(request: Request, video_id: str, fmt: str):
     check_access(request, "episode:" + video_id)
     if not VIDEO_ID_RE.match(video_id) or fmt not in TRANSCRIPT_TYPES:
         raise HTTPException(404, "Unknown transcript")
-    if whisper_stt is None:
+    if transcribe_audio is None:
         raise HTTPException(404, "Transcripts are not enabled on this server")
     result = load_transcript(video_id)
     if result is None:
         request_transcript(video_id)
-        status = "queued" if audio_path(video_id).exists() else "available after the episode audio has been downloaded"
+        if not audio_path(video_id).exists():
+            status = "available after the episode audio has been downloaded"
+        elif (failed_at := _transcribe_failed.get(video_id)) and time.time() - failed_at < TRANSCRIBE_RETRY_AFTER:
+            status = f"the last attempt failed; retrying in {(int(failed_at + TRANSCRIBE_RETRY_AFTER - time.time()) + 59) // 60} minutes"
+        else:
+            status = "queued"
         raise HTTPException(404, f"Transcript not ready yet ({status})", headers={"Retry-After": "600"})
     if fmt == "json":
         return result
-    body = {"vtt": whisper_stt.to_vtt, "srt": whisper_stt.to_srt, "txt": lambda r: r["text"] + "\n"}[fmt](result)
+    body = {"vtt": to_vtt, "srt": to_srt, "txt": lambda r: r["text"] + "\n"}[fmt](result)
     return Response(body, media_type=f"{TRANSCRIPT_TYPES[fmt]}; charset=utf-8")
 
 

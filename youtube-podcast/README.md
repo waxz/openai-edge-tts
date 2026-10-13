@@ -17,7 +17,7 @@ Apple Podcasts, Pocket Casts, AntennaPod, Overcast or any other podcast app.
 - Episode lists come from YouTube's public feeds: the newest 15 videos, no API key needed. Shorts are left out unless you add `?shorts=true`.
 - Audio is downloaded with [yt-dlp](https://github.com/yt-dlp/yt-dlp) the first time an episode is played, saved as M4A (AAC), and served from a local cache with seeking support.
 - The newest episodes are downloaded in the background whenever a podcast app refreshes the feed, so they are ready to play.
-- Optional transcripts: when `whisper_stt.py` (from `hf-space/`) and `faster-whisper` are installed, each downloaded episode is transcribed in the background and the feed links it with `<podcast:transcript>`. The combined Space in `hf-space/` does this out of the box.
+- Optional transcripts: each downloaded episode is transcribed in the background with Whisper and the feed links it with `<podcast:transcript>`. Point `WHISPER_API_URL` at any OpenAI-compatible speech-to-text server, such as the Space in `hf-space/`, so the heavy model runs there and this server stays light.
 
 ## Feed URLs
 
@@ -35,7 +35,9 @@ The home page has a box where you paste a YouTube link and get the feed URL.
 ```bash
 docker build -t yt-podcast .
 docker run -d -p 7860:7860 -v yt-podcast-cache:/home/user/cache \
-  -e BASE_URL=http://<your-ip>:7860 -e ACCESS_KEY=change-me yt-podcast
+  -e BASE_URL=http://<your-ip>:7860 -e ACCESS_KEY=change-me \
+  -e WHISPER_API_URL=https://nxdev-org-tts.hf.space -e WHISPER_API_KEY=<the Space API_KEY> \
+  yt-podcast
 ```
 
 Without Docker (needs Python 3.10+, ffmpeg, and Deno or Node.js for yt-dlp):
@@ -59,7 +61,10 @@ python podcast.py          # listens on port 7860
 | `YTDLP_EXTRA_ARGS` | none | Extra yt-dlp arguments, e.g. `--js-runtimes node` |
 | `YTDLP_MIN_INTERVAL` | `20` | Seconds between yt-dlp runs; downloads never run in parallel |
 | `RATE_LIMIT_COOLDOWN` | `900` | After a 429 or bot check, stop contacting YouTube this many seconds (doubles on each repeat, up to 6 hours) |
-| `TRANSCRIPTS` | `auto` | `auto` transcribes when Whisper is installed; `on` requires it; `off` disables |
+| `WHISPER_API_URL` | none | OpenAI-compatible speech-to-text server for transcripts, e.g. `https://nxdev-org-tts.hf.space` |
+| `WHISPER_API_KEY` | none | Its API key (sent as `Authorization: Bearer`) |
+| `TRANSCRIBE_CHUNK_SECONDS` | `600` | Episodes are sent in pieces this long (16 kHz mono MP3, ~2.5 MB per 10 minutes) |
+| `TRANSCRIPTS` | `auto` | `auto` uses `WHISPER_API_URL`, else a local `whisper_stt.py`; `off` disables |
 
 ## Access
 
@@ -94,9 +99,11 @@ not a bot"). Episode lists still work there; audio does not. In order of reliabi
 1. **A computer at home** (PC, NAS, Raspberry Pi) with a home internet connection. Use a tunnel such as Cloudflare Tunnel or Tailscale Funnel so your podcast app can reach it.
 2. **A cloud host with cookies.** Export YouTube cookies from a logged-in browser (see the [yt-dlp FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp)) and set `YTDLP_COOKIES_TEXT`. Use a spare Google account: YouTube can rate-limit or flag accounts used this way, and cookies expire, so expect to refresh them.
 
-On Hugging Face, this folder can be uploaded as a Docker Space as is. Set `ACCESS_KEY` and
-`YTDLP_COOKIES_TEXT` as Space secrets. The free Space disk is not persistent, so the cache is
-lost when the Space restarts.
+**Not on Hugging Face:** Spaces can't connect to `www.youtube.com` at all (`/health` shows the
+connection being cut), so neither episode lists nor audio work there. Keep the models on the Space
+and run this server elsewhere with `WHISPER_API_URL` pointing at it.
+
+Open `/health` on any host to check whether it can reach YouTube.
 
 Only use this for videos you have the right to download, and keep feeds private: YouTube's terms
 don't allow redistributing its content.

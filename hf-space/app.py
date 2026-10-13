@@ -4,7 +4,9 @@
     stt      whisper_stt.py  OpenAI-compatible Whisper STT    /v1/audio/transcriptions, /v1/audio/translations
     podcast  podcast.py      YouTube channels as podcasts     /podcast/  (feeds at /podcast/feed/<channel>)
 
-MODULES picks which ones load (default "tts,stt,podcast"). A module that fails to import is
+MODULES picks which ones load (default "tts,stt"). The podcast module is off by default because
+Hugging Face Spaces can't reach www.youtube.com; run youtube-podcast/ elsewhere and point its
+WHISPER_API_URL at this Space for transcripts. A module that fails to import is
 skipped and reported at /, so one broken service doesn't take the others down.
 
 Modules either get their own path prefix (podcast -> /podcast) or, to keep OpenAI-style URLs,
@@ -28,7 +30,7 @@ AVAILABLE = {
     "stt": ("whisper_stt", None, "/v1/audio/transcriptions"),
     "podcast": ("podcast", "/podcast", "/podcast/"),
 }
-ENABLED = [m.strip() for m in os.environ.get("MODULES", "tts,stt,podcast").split(",") if m.strip()]
+ENABLED = [m.strip() for m in os.environ.get("MODULES", "tts,stt").split(",") if m.strip()]
 
 if os.environ.get("API_KEY") and not os.environ.get("ACCESS_KEY"):
     os.environ["ACCESS_KEY"] = os.environ["API_KEY"]

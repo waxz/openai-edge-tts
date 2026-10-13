@@ -15,7 +15,8 @@ datacenter IPs; set YTDLP_COOKIES to a cookies.txt export if that happens.
 
 Environment:
     BASE_URL          public URL of this server, used in feed links (default: from the request)
-    ACCESS_KEY        if set, feeds and audio need ?key=<ACCESS_KEY>; feed links carry it automatically
+    ACCESS_KEY        if set, feeds and audio need ?key=<key>; comma-separate several keys. Feed links carry
+                      the key the feed was requested with, so podcast apps just work
     CACHE_DIR         where audio is stored (default ./cache)
     CACHE_MAX_GB      oldest audio is deleted above this size (default 5)
     PREFETCH          newest episodes to download in the background when a feed is read (default 2)
@@ -52,7 +53,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
-ACCESS_KEY = os.environ.get("ACCESS_KEY", "")
+ACCESS_KEYS = [k.strip() for k in os.environ.get("ACCESS_KEY", "").split(",") if k.strip()]
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "cache"))
 CACHE_MAX_BYTES = int(float(os.environ.get("CACHE_MAX_GB", "5")) * 1024**3)
 PREFETCH = int(os.environ.get("PREFETCH", "2"))
@@ -378,7 +379,7 @@ def prefetch(video_ids: list[str]):
 # ---------------------------------------------------------------- RSS
 
 def check_key(request: Request):
-    if ACCESS_KEY and request.query_params.get("key") != ACCESS_KEY:
+    if ACCESS_KEYS and request.query_params.get("key", "").strip() not in ACCESS_KEYS:
         raise HTTPException(401, "Missing or wrong ?key=")
 
 
@@ -391,8 +392,8 @@ def base_url(request: Request) -> str:
     return f"{proto}://{request.headers.get('host', request.url.netloc)}{root_path}"
 
 
-def build_rss(feed: dict, base: str, include_shorts: bool) -> bytes:
-    key_query = f"?key={urllib.parse.quote(ACCESS_KEY)}" if ACCESS_KEY else ""
+def build_rss(feed: dict, base: str, include_shorts: bool, key: str = "") -> bytes:
+    key_query = f"?key={urllib.parse.quote(key)}" if key else ""
     rss = ET.Element("rss", {"version": "2.0"})
     ch = ET.SubElement(rss, "channel")
 
@@ -482,7 +483,8 @@ def feed(request: Request, source: str, shorts: bool = False):
     data = load_feed(kind, ident)
     if PREFETCH > 0:
         prefetch([e["id"] for e in data["episodes"] if shorts or not e["short"]][:PREFETCH])
-    return Response(build_rss(data, base_url(request), shorts), media_type="application/rss+xml; charset=utf-8")
+    key = request.query_params.get("key", "").strip() if ACCESS_KEYS else ""
+    return Response(build_rss(data, base_url(request), shorts, key), media_type="application/rss+xml; charset=utf-8")
 
 
 @app.api_route("/audio/{video_id}.m4a", methods=["GET", "HEAD"])

@@ -50,7 +50,7 @@ python podcast.py          # listens on port 7860
 | Variable | Default | Meaning |
 |---|---|---|
 | `BASE_URL` | taken from the request | Public address used in feed links, e.g. `https://pod.example.com` |
-| `ACCESS_KEY` | none | Require `?key=...` on feeds and audio. Feed links include it, so podcast apps just work. |
+| `ACCESS_KEY` | none | Require `?key=...` on feeds and audio (comma-separate several keys). Feed links carry the key the feed was opened with, so podcast apps just work. |
 | `CACHE_DIR` | `./cache` | Where audio is stored |
 | `CACHE_MAX_GB` | `5` | Oldest episodes are deleted above this size |
 | `PREFETCH` | `2` | Newest episodes to download in the background when a feed is read (0 = off) |

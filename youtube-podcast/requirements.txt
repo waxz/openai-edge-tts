@@ -1,0 +1,4 @@
+fastapi>=0.115
+uvicorn>=0.30
+# Unpinned on purpose: YouTube changes often and old yt-dlp versions stop working.
+yt-dlp[default]

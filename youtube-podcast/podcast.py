@@ -55,7 +55,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 ACCESS_KEYS = [k.strip() for k in os.environ.get("ACCESS_KEY", "").split(",") if k.strip()]
@@ -146,12 +146,39 @@ def _record_failure(video_id: str, error: str):
 app = FastAPI(title="YouTube to Podcast", docs_url=None, redoc_url=None)
 
 
+@app.exception_handler(Exception)
+async def unexpected_error(request: Request, e: Exception):
+    # Always answer in JSON so the web page can show the problem.
+    print(f"error on {request.url.path}: {type(e).__name__}: {e}", flush=True)
+    return JSONResponse({"detail": f"Server error: {type(e).__name__}: {e}"}, status_code=500)
+
+
 # ---------------------------------------------------------------- YouTube metadata
 
-def http_get(url: str, timeout: int = 20) -> bytes:
+def http_get(url: str, timeout: int = 20, stop_after: bytes | None = None) -> bytes:
+    """GET a YouTube URL, retrying dropped connections. With stop_after, stop reading once that
+    marker and the end of its tag have arrived (channel pages are ~1.7 MB; the metadata is mid-page).
+    HTTP errors (404, 429, ...) are raised as urllib.error.HTTPError for the caller to handle."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if stop_after is None:
+                    return r.read()
+                data = b""
+                while chunk := r.read(64 * 1024):
+                    data += chunk
+                    found = data.find(stop_after)
+                    if found != -1 and data.find(b">", found) != -1:
+                        break
+                return data
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, OSError) as e:  # dropped TLS connection, reset, timeout
+            if attempt == 2:
+                reason = getattr(e, "reason", e)
+                raise HTTPException(502, f"Could not reach YouTube ({reason}). Try again in a minute.")
+            time.sleep(1 + attempt * 2)
 
 
 def channel_page_info(path: str) -> dict:
@@ -159,7 +186,7 @@ def channel_page_info(path: str) -> dict:
     if path in _channel_cache:
         return _channel_cache[path]
     try:
-        page = http_get(f"https://www.youtube.com/{path}").decode("utf-8", "replace")
+        page = http_get(f"https://www.youtube.com/{path}", stop_after=b'property="og:description"').decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         raise HTTPException(404 if e.code == 404 else 502, f"YouTube returned {e.code} for /{path}")
     meta = lambda prop: (m := re.search(rf'<meta property="{prop}" content="([^"]*)"', page)) and html.unescape(m.group(1))
@@ -477,7 +504,7 @@ def index():
     return INDEX_HTML.replace("__KEY_FIELD__", "" if ACCESS_KEYS else "hidden")
 
 
-INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+INDEX_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>YouTube to Podcast</title><style>
 body{font:16px/1.5 system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#1f2328;background:#fff}
 label{display:block;margin:12px 0 4px;font-weight:600}input{width:100%;padding:8px;box-sizing:border-box;font:inherit}
@@ -501,8 +528,9 @@ document.getElementById('f').onsubmit=async function(e){
   var q=new URLSearchParams({url:document.getElementById('u').value,key:k.value});
   if(document.getElementById('s').checked)q.set('shorts','true');
   try{
-    var r=await fetch(location.pathname.replace(/\/?$/,'/')+'api/feed-url?'+q),d=await r.json();
-    if(!r.ok)throw new Error(d.detail||r.status);
+    var r=await fetch(location.pathname.replace(/\/?$/,'/')+'api/feed-url?'+q),t=await r.text(),d;
+    try{d=JSON.parse(t)}catch(e){throw new Error('Server answered '+r.status+': '+(t.replace(/<[^>]*>/g,' ').trim().slice(0,200)||r.statusText))}
+    if(!r.ok)throw new Error(d.detail||('Error '+r.status));
     try{localStorage.setItem('podcastKey',k.value)}catch(e){}
     o.innerHTML='';var p=document.createElement('p');p.textContent='Feed for '+d.title+' ('+d.episodes+' episodes):';
     var c=document.createElement('code');c.textContent=d.feed_url;var b=document.createElement('button');b.textContent='Copy';

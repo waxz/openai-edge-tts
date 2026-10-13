@@ -43,6 +43,7 @@ import queue
 import re
 import shlex
 import shutil
+import ssl
 import subprocess
 import threading
 import time
@@ -548,6 +549,41 @@ def api_feed_url(request: Request, url: str, shorts: bool = False):
     data = load_feed(kind, ident)  # fails with a clear error if the channel or playlist doesn't exist
     episodes = sum(1 for e in data["episodes"] if shorts or not e["short"])
     return {"feed_url": signed_feed_url(base_url(request), ident, shorts), "title": data["title"], "episodes": episodes}
+
+
+_health_cache: dict = {"at": 0.0, "result": None}
+
+
+@app.get("/health")
+def health():
+    """Can this server reach YouTube? Tries a few request styles; cached for a minute. No secrets shown."""
+    if time.time() - _health_cache["at"] < 60:
+        return _health_cache["result"]
+
+    def probe(url: str, context: ssl.SSLContext | None = None, limit: int = 300_000) -> dict:
+        started = time.time()
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=context) as r:
+                size = len(r.read(limit))
+                return {"ok": True, "status": r.status, "bytes": size, "seconds": round(time.time() - started, 2)}
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "status": e.code, "seconds": round(time.time() - started, 2)}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {getattr(e, 'reason', e)}", "seconds": round(time.time() - started, 2)}
+
+    tls12 = ssl.create_default_context()
+    tls12.maximum_version = ssl.TLSVersion.TLSv1_2
+    result = {
+        "openssl": ssl.OPENSSL_VERSION,
+        "atom_feed": probe("https://www.youtube.com/feeds/videos.xml?channel_id=UCBJycsmduvYEL83R_U4JriQ"),
+        "channel_page": probe("https://www.youtube.com/@mkbhd"),
+        "channel_page_tls12": probe("https://www.youtube.com/@mkbhd", tls12),
+        "thumbnail_host": probe("https://i.ytimg.com/vi/e1q-TuHdc4Y/hqdefault.jpg"),
+        "google": probe("https://www.google.com/generate_204"),
+    }
+    _health_cache.update(at=time.time(), result=result)
+    return result
 
 
 @app.get("/status")

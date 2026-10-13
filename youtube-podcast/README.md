@@ -41,7 +41,7 @@ Without Docker (needs Python 3.10+, ffmpeg, and Deno or Node.js for yt-dlp):
 
 ```bash
 pip install -r requirements.txt
-python app.py              # listens on port 7860
+python podcast.py          # listens on port 7860
 ```
 
 ## Settings

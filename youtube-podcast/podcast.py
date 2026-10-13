@@ -1,5 +1,8 @@
 """Turn YouTube channels and playlists into podcast RSS feeds.
 
+Runs on its own (`python podcast.py`) or as a module mounted into a larger FastAPI app
+(`root.mount("/podcast", podcast.app)`); every link it generates respects the mount path.
+
     GET /                         small page that builds a feed URL from a YouTube link
     GET /feed/{source}            podcast RSS; source is a channel id (UC...), @handle or playlist id (PL...)
     GET /feed?url=<youtube url>   redirects to /feed/{source}
@@ -247,10 +250,12 @@ def check_key(request: Request):
 
 
 def base_url(request: Request) -> str:
+    """Public URL of this app, including the mount path when it runs as a module."""
+    root_path = request.scope.get("root_path", "").rstrip("/")
     if BASE_URL:
-        return BASE_URL
+        return BASE_URL + root_path
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-    return f"{proto}://{request.headers.get('host', request.url.netloc)}"
+    return f"{proto}://{request.headers.get('host', request.url.netloc)}{root_path}"
 
 
 def build_rss(feed: dict, base: str, include_shorts: bool) -> bytes:
@@ -305,7 +310,7 @@ def index():
 input{width:100%;padding:8px;box-sizing:border-box}code{word-break:break-all}</style></head><body>
 <h1>YouTube to Podcast</h1><p>Paste a channel or playlist link, then add the feed URL to your podcast app.</p>
 <form onsubmit="event.preventDefault();var k=new URLSearchParams(location.search).get('key');
-var u=location.origin+'/feed?url='+encodeURIComponent(this.u.value)+(k?'&key='+encodeURIComponent(k):'');
+var u=location.origin+location.pathname.replace(/\/?$/,'/')+'feed?url='+encodeURIComponent(this.u.value)+(k?'&key='+encodeURIComponent(k):'');
 document.getElementById('o').innerHTML='<p>Feed URL:</p><code>'+u.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</code>'">
 <input name="u" placeholder="https://www.youtube.com/@channel or ...playlist?list=PL..." required></form><div id="o"></div></body></html>"""
 
@@ -315,7 +320,8 @@ def feed_from_url(request: Request, url: str):
     check_key(request)
     _, ident = parse_source(url)
     query = urllib.parse.urlencode({k: v for k, v in request.query_params.items() if k != "url"})
-    return RedirectResponse(f"/feed/{urllib.parse.quote(ident)}" + (f"?{query}" if query else ""), status_code=302)
+    root_path = request.scope.get("root_path", "").rstrip("/")
+    return RedirectResponse(f"{root_path}/feed/{urllib.parse.quote(ident)}" + (f"?{query}" if query else ""), status_code=302)
 
 
 @app.get("/feed/{source}")

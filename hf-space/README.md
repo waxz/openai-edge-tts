@@ -1,5 +1,5 @@
 ---
-title: Kokoro OpenAI TTS
+title: Kokoro TTS and YouTube Podcasts
 emoji: 🗣️
 colorFrom: indigo
 colorTo: blue
@@ -7,10 +7,25 @@ sdk: docker
 app_port: 7860
 pinned: false
 license: apache-2.0
-short_description: OpenAI-compatible TTS API for Kokoro-82M (EN + ZH)
+short_description: OpenAI-compatible Kokoro TTS + YouTube-to-podcast feeds
 ---
 
-# Kokoro OpenAI-compatible TTS
+# Kokoro TTS and YouTube Podcasts
+
+One Space running independent modules, each its own FastAPI app (`app.py` mounts them):
+
+| Module | File | Paths |
+|---|---|---|
+| `tts` | `kokoro_tts.py` | `/v1/audio/speech`, `/v1/models`, `/v1/audio/voices` |
+| `podcast` | `podcast.py` (from `youtube-podcast/`) | `/podcast/`, feeds at `/podcast/feed/@channel?key=<API_KEY>` |
+
+Set `MODULES` (default `tts,podcast`) to choose which load. `GET /` lists loaded and failed modules.
+The `API_KEY` secret protects both: TTS needs `Authorization: Bearer <key>`, podcast feeds need `?key=<key>`
+(or set a separate `ACCESS_KEY`). Podcast settings are described in `youtube-podcast/README.md`.
+
+Deploy from the repo with `HF_TOKEN=... python hf-space/deploy.py <user>/<space>`.
+
+## TTS module
 
 An OpenAI-style `/v1/audio/speech` API for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) and
 [Kokoro-82M-v1.1-zh](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh), sized for a free CPU Space.

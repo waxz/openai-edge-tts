@@ -12,8 +12,8 @@ WORKDIR /home/user/app
 
 COPY --chown=user requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
-COPY --chown=user app.py .
+COPY --chown=user podcast.py .
 
 EXPOSE 7860
 # Refresh yt-dlp on every start so YouTube changes don't break downloads; keep going if offline.
-CMD pip install --no-cache-dir --user -q -U "yt-dlp[default]" || true; exec python app.py
+CMD pip install --no-cache-dir --user -q -U "yt-dlp[default]" || true; exec python podcast.py

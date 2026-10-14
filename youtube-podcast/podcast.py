@@ -33,7 +33,8 @@ Environment:
                       background; once ready, the feed links it with <podcast:transcript>, which many
                       podcast apps display. Uses WHISPER_API_URL if set, else a local whisper_stt.py.
     WHISPER_API_URL   an OpenAI-compatible speech-to-text server, e.g. https://<user>-<space>.hf.space
-                      (the Space in hf-space/). Episodes are sent in 10-minute pieces.
+                      (the Space in hf-space/). Episodes are uploaded in 10-minute pieces; the Space
+                      joins them back into one recording (other servers transcribe piece by piece).
     WHISPER_API_KEY   its API key (sent as a Bearer token)
 """
 
@@ -394,42 +395,93 @@ def to_vtt(result: dict) -> str:
     return "WEBVTT\n\n" + "".join(f"{_timestamp(s['start'], '.')} --> {_timestamp(s['end'], '.')}\n{s['text']}\n\n" for s in result["segments"])
 
 
-def _multipart(fields: dict[str, str], file_name: str, file_bytes: bytes) -> tuple[bytes, str]:
+def _multipart(fields: dict[str, str], file_name: str | None = None, file_bytes: bytes = b"") -> tuple[bytes, str]:
     boundary = f"----podcast{os.urandom(8).hex()}"
     parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields.items()]
-    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{file_name}"\r\nContent-Type: audio/mpeg\r\n\r\n'.encode() + file_bytes + b"\r\n")
+    if file_name:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{file_name}"\r\nContent-Type: audio/ogg\r\n\r\n'.encode() + file_bytes + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
-def transcribe_remote(path: str) -> dict:
-    """Transcribe with WHISPER_API_URL in TRANSCRIBE_CHUNK_SECONDS pieces of 16 kHz mono MP3, so each
-    upload is small (~2.5 MB per 10 minutes) and finishes well inside proxy time limits."""
-    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path], capture_output=True, text=True)
-    duration = float(probe.stdout.strip() or 0)
-    language, segments, texts = None, [], []
-    started = time.time()
+class _JobsUnsupported(Exception):
+    pass
+
+
+def _whisper_api(method: str, path: str, fields: dict | None = None, file_bytes: bytes | None = None, timeout: int = 300) -> dict:
+    headers = {"Authorization": f"Bearer {WHISPER_API_KEY}"} if WHISPER_API_KEY else {}
+    body = None
+    if fields is not None or file_bytes is not None:
+        body, headers["Content-Type"] = _multipart(fields or {}, "audio.ogg" if file_bytes is not None else None, file_bytes or b"")
+    req = urllib.request.Request(f"{WHISPER_API_URL}{path}", data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Whisper API {method} {path} returned {e.code}: {e.read()[:300].decode('utf-8', 'replace')}") from e
+
+
+def _audio_pieces(path: str, duration: float):
+    """16 kHz mono Ogg/Opus pieces of TRANSCRIBE_CHUNK_SECONDS. Opus pieces decode back sample-exact,
+    so they can be joined without gaps (MP3 would pad each piece by ~80 ms)."""
     for offset in range(0, max(int(duration), 1), TRANSCRIBE_CHUNK_SECONDS):
-        piece = subprocess.run(
+        yield offset, subprocess.run(
             ["ffmpeg", "-v", "error", "-ss", str(offset), "-t", str(TRANSCRIBE_CHUNK_SECONDS), "-i", path,
-             "-ac", "1", "-ar", "16000", "-b:a", "32k", "-f", "mp3", "pipe:1"],
+             "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "24k", "-f", "ogg", "pipe:1"],
             capture_output=True, check=True,
         ).stdout
+
+
+def transcribe_remote(path: str) -> dict:
+    """Transcribe with WHISPER_API_URL. Prefers its job API (pieces joined into one recording on the
+    server, so no word is cut at a piece boundary); falls back to transcribing piece by piece."""
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path], capture_output=True, text=True)
+    duration = float(probe.stdout.strip() or 0)
+    started = time.time()
+    try:
+        result, how = _transcribe_job(path, duration), "one job"
+    except _JobsUnsupported:
+        result, how = _transcribe_pieces(path, duration), "pieces"
+    print(f"transcribed {duration:.0f}s via {WHISPER_API_URL} ({how}) in {time.time() - started:.0f}s", flush=True)
+    return result
+
+
+def _transcribe_job(path: str, duration: float) -> dict:
+    try:
+        job = _whisper_api("POST", "/v1/audio/transcriptions/jobs", fields={"task": "transcribe"})
+    except RuntimeError as e:
+        if isinstance(e.__cause__, urllib.error.HTTPError) and e.__cause__.code in (404, 405):
+            raise _JobsUnsupported() from e
+        raise
+    job_path = f"/v1/audio/transcriptions/jobs/{job['id']}"
+    for index, (_, piece) in enumerate(_audio_pieces(path, duration)):
+        _whisper_api("POST", f"{job_path}/parts", fields={"index": str(index)}, file_bytes=piece)
+    _whisper_api("POST", f"{job_path}/complete", fields={})
+    deadline = time.time() + max(3600, duration * 4)  # CPU Whisper can be slower than real time
+    while time.time() < deadline:
+        time.sleep(10)
+        job = _whisper_api("GET", job_path)
+        if job["status"] == "completed":
+            result = job["result"]
+            segments = [{"id": i, "start": s["start"], "end": s["end"], "text": s["text"].strip()}
+                        for i, s in enumerate(s for s in result.get("segments", []) if s.get("text", "").strip())]
+            return {"language": result.get("language"), "duration": round(duration, 2), "text": result.get("text", ""), "segments": segments}
+        if job["status"] == "failed":
+            raise RuntimeError(f"Whisper job failed: {job.get('error')}")
+    raise RuntimeError(f"Whisper job {job['id']} did not finish in time")
+
+
+def _transcribe_pieces(path: str, duration: float) -> dict:
+    """For servers without the job API: one plain OpenAI transcription request per piece."""
+    language, segments, texts = None, [], []
+    for offset, piece in _audio_pieces(path, duration):
         fields = {"model": "whisper-1", "response_format": "verbose_json", **({"language": language} if language else {})}
-        body, content_type = _multipart(fields, "audio.mp3", piece)
-        headers = {"Content-Type": content_type, **({"Authorization": f"Bearer {WHISPER_API_KEY}"} if WHISPER_API_KEY else {})}
-        req = urllib.request.Request(f"{WHISPER_API_URL}/v1/audio/transcriptions", data=body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=1800) as r:
-                result = json.load(r)
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"Whisper API returned {e.code}: {e.read()[:300].decode('utf-8', 'replace')}")
+        result = _whisper_api("POST", "/v1/audio/transcriptions", fields=fields, file_bytes=piece, timeout=1800)
         language = language or result.get("language")  # keep later pieces in the language of the first
         for seg in result.get("segments") or [{"start": 0, "end": result.get("duration", 0), "text": result.get("text", "")}]:
             if seg.get("text", "").strip():
                 segments.append({"id": len(segments), "start": round(seg["start"] + offset, 2), "end": round(seg["end"] + offset, 2), "text": seg["text"].strip()})
         texts.append(result.get("text", "").strip())
-    print(f"transcribed {duration:.0f}s via {WHISPER_API_URL} in {time.time() - started:.0f}s", flush=True)
     joiner = "" if language in ("zh", "ja", "yue", "chinese", "japanese") else " "
     return {"language": language, "duration": round(duration, 2), "text": joiner.join(t for t in texts if t), "segments": segments}
 

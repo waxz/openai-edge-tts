@@ -63,7 +63,7 @@ python podcast.py          # listens on port 7860
 | `RATE_LIMIT_COOLDOWN` | `900` | After a 429 or bot check, stop contacting YouTube this many seconds (doubles on each repeat, up to 6 hours) |
 | `WHISPER_API_URL` | none | OpenAI-compatible speech-to-text server for transcripts, e.g. `https://nxdev-org-tts.hf.space` |
 | `WHISPER_API_KEY` | none | Its API key (sent as `Authorization: Bearer`) |
-| `TRANSCRIBE_CHUNK_SECONDS` | `600` | Episodes are sent in pieces this long (16 kHz mono MP3, ~2.5 MB per 10 minutes) |
+| `TRANSCRIBE_CHUNK_SECONDS` | `600` | Episodes are uploaded in pieces this long (16 kHz mono Opus, ~1.8 MB per 10 minutes). The Space joins them back into one recording; other servers transcribe each piece separately, which can clip a word at each boundary |
 | `TRANSCRIPTS` | `auto` | `auto` uses `WHISPER_API_URL`, else a local `whisper_stt.py`; `off` disables |
 
 ## Access

@@ -3,20 +3,35 @@
     POST /v1/audio/transcriptions   OpenAI "Create transcription" (multipart: file, model, language, prompt, response_format)
     POST /v1/audio/translations     OpenAI "Create translation" (to English)
 
-Other modules can call transcribe(path) directly; the podcast module uses it for episode transcripts.
+Long recordings (extension, used by the podcast server): upload in pieces, the Space joins them
+into one continuous recording before transcribing, so no word is cut at a piece boundary.
+    POST   /v1/audio/transcriptions/jobs                 create a job (form: language, prompt, task)
+    POST   /v1/audio/transcriptions/jobs/{id}/parts      add the next piece (multipart: file, index)
+    POST   /v1/audio/transcriptions/jobs/{id}/complete   join the pieces and start transcribing
+    GET    /v1/audio/transcriptions/jobs/{id}            status; the result once "completed"
+                                                         (?response_format=verbose_json|json|text|srt|vtt)
+    DELETE /v1/audio/transcriptions/jobs/{id}
+Pieces must join without gaps: use Ogg/Opus or FLAC (MP3 pads every piece by ~80 ms).
+
+Other modules can call transcribe(path) directly.
 
 Environment:
     WHISPER_MODEL    faster-whisper model: tiny, base, small (default), medium, large-v3-turbo, ...
     WHISPER_THREADS  CPU threads (default: all cores)
     WHISPER_BEAM     beam size; 1 (default) is greedy decoding, fastest on CPU
     MAX_UPLOAD_MB    largest accepted upload (default 200)
+    MAX_JOB_MB       largest total of a job's pieces (default 1000); jobs are kept for 24 hours
     API_KEY          require `Authorization: Bearer <key>` (comma-separate several keys)
 """
 
 import os
+import queue
+import shutil
 import tempfile
 import threading
 import time
+import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +41,9 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_THREADS = int(os.environ.get("WHISPER_THREADS", "0")) or (os.cpu_count() or 2)
 WHISPER_BEAM = int(os.environ.get("WHISPER_BEAM", "1"))
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "200")) * 1024 * 1024
+MAX_JOB_BYTES = int(os.environ.get("MAX_JOB_MB", "1000")) * 1024 * 1024
+JOB_TTL = 24 * 3600
+JOBS_DIR = Path(tempfile.gettempdir()) / "stt-jobs"
 API_KEYS = [k.strip() for k in os.environ.get("API_KEY", "").split(",") if k.strip()]
 
 # Paths this module serves when mounted at the root next to other modules (see app.py).
@@ -58,12 +76,12 @@ def get_model():
         return _model
 
 
-def transcribe(path: str, language: str | None = None, prompt: str | None = None, task: str = "transcribe", temperature: float = 0.0) -> dict:
-    """Transcribe an audio file. Returns {language, duration, text, segments: [{id, start, end, text}]}."""
+def transcribe(path_or_audio, language: str | None = None, prompt: str | None = None, task: str = "transcribe", temperature: float = 0.0) -> dict:
+    """Transcribe an audio file (or 16 kHz mono samples). Returns {language, duration, text, segments: [{id, start, end, text}]}."""
     from faster_whisper import decode_audio
 
     model = get_model()
-    audio = decode_audio(path)
+    audio = decode_audio(path_or_audio) if isinstance(path_or_audio, str) else path_or_audio
     with _run_lock:
         started = time.time()
         if not language and not prompt:
@@ -97,6 +115,59 @@ def to_srt(result: dict) -> str:
 
 def to_vtt(result: dict) -> str:
     return "WEBVTT\n\n" + "".join(f"{_timestamp(s['start'], '.')} --> {_timestamp(s['end'], '.')}\n{s['text']}\n\n" for s in result["segments"])
+
+
+# ---------------------------------------------------------------- jobs: long recordings in pieces
+
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+_job_queue: "queue.Queue[str]" = queue.Queue()
+_job_worker: threading.Thread | None = None
+
+
+def _job_public(job: dict) -> dict:
+    return {k: job[k] for k in ("id", "object", "status", "created_at", "parts", "bytes", "error") if k in job}
+
+
+def _purge_old_jobs():
+    now = time.time()
+    with _jobs_lock:
+        for job_id in [j for j, job in _jobs.items() if now - job["created_at"] > JOB_TTL]:
+            shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
+            del _jobs[job_id]
+
+
+def _run_job(job_id: str):
+    from faster_whisper import decode_audio
+    import numpy as np
+
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    job["status"] = "running"
+    folder = JOBS_DIR / job_id
+    try:
+        parts = sorted(folder.glob("part-*"))
+        audio = np.concatenate([decode_audio(str(p)) for p in parts])  # one continuous recording
+        job["result"] = transcribe(audio, language=job["language"], prompt=job["prompt"], task=job["task"])
+        job["status"] = "completed"
+    except Exception as e:
+        job["status"], job["error"] = "failed", f"{type(e).__name__}: {e}"
+        print(f"job {job_id} failed: {job['error']}", flush=True)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)  # keep only the (small) result
+
+
+def _job_loop():
+    while True:
+        _run_job(_job_queue.get())
+
+
+def _get_job(job_id: str) -> dict:
+    job = _jobs.get(job_id)
+    if job is None:
+        raise ApiError(404, f"No transcription job '{job_id}' (jobs are kept for 24 hours and lost when the server restarts).", "id", "job_not_found")
+    return job
 
 
 # ---------------------------------------------------------------- HTTP API
@@ -162,6 +233,84 @@ def create_transcription(
     temperature: float = Form(0.0),
 ):
     return _handle(file, "transcribe", language, prompt, response_format, temperature)
+
+
+@app.post("/v1/audio/transcriptions/jobs")
+def create_job(language: str | None = Form(None), prompt: str | None = Form(None), task: str = Form("transcribe")):
+    if task not in ("transcribe", "translate"):
+        raise ApiError(400, "Invalid value for 'task': use 'transcribe' or 'translate'.", "task", "invalid_value")
+    _purge_old_jobs()
+    job_id = "stt_" + uuid.uuid4().hex
+    (JOBS_DIR / job_id).mkdir(parents=True)
+    job = {"id": job_id, "object": "transcription.job", "status": "receiving", "created_at": int(time.time()),
+           "parts": 0, "bytes": 0, "language": language or None, "prompt": prompt or None, "task": task}
+    with _jobs_lock:
+        _jobs[job_id] = job
+    return _job_public(job)
+
+
+@app.post("/v1/audio/transcriptions/jobs/{job_id}/parts")
+def add_job_part(job_id: str, file: UploadFile = File(...), index: int | None = Form(None)):
+    job = _get_job(job_id)
+    if job["status"] != "receiving":
+        raise ApiError(409, f"Job is {job['status']}; parts can only be added before /complete.", "id", "job_not_receiving")
+    with _jobs_lock:
+        index = job["parts"] if index is None else index
+        job["parts"] += 1
+    target = JOBS_DIR / job_id / f"part-{index:06d}"
+    size = 0
+    with open(target, "wb") as out:
+        while chunk := file.file.read(1 << 20):
+            size += len(chunk)
+            if job["bytes"] + size > MAX_JOB_BYTES:
+                out.close()
+                target.unlink(missing_ok=True)
+                raise ApiError(413, f"Job is larger than {MAX_JOB_BYTES >> 20} MB.", "file", "job_too_large")
+            out.write(chunk)
+    job["bytes"] += size
+    return _job_public(job)
+
+
+@app.post("/v1/audio/transcriptions/jobs/{job_id}/complete")
+def complete_job(job_id: str):
+    global _job_worker
+    job = _get_job(job_id)
+    if job["status"] != "receiving":
+        raise ApiError(409, f"Job is already {job['status']}.", "id", "job_not_receiving")
+    if job["parts"] == 0:
+        raise ApiError(400, "Upload at least one part before completing the job.", "file", "missing_required_parameter")
+    job["status"] = "queued"
+    with _jobs_lock:
+        if _job_worker is None:
+            _job_worker = threading.Thread(target=_job_loop, daemon=True)
+            _job_worker.start()
+    _job_queue.put(job_id)
+    return _job_public(job)
+
+
+@app.get("/v1/audio/transcriptions/jobs/{job_id}")
+def get_job(job_id: str, response_format: str = "verbose_json"):
+    job = _get_job(job_id)
+    if job["status"] != "completed":
+        return _job_public(job)
+    result = job["result"]
+    if response_format == "text":
+        return PlainTextResponse(result["text"])
+    if response_format == "srt":
+        return PlainTextResponse(to_srt(result), media_type="application/x-subrip")
+    if response_format == "vtt":
+        return PlainTextResponse(to_vtt(result), media_type="text/vtt")
+    body = {"task": job["task"], **result} if response_format == "verbose_json" else {"text": result["text"]}
+    return {**_job_public(job), "result": body}
+
+
+@app.delete("/v1/audio/transcriptions/jobs/{job_id}")
+def delete_job(job_id: str):
+    _get_job(job_id)
+    with _jobs_lock:
+        _jobs.pop(job_id, None)
+    shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
+    return {"id": job_id, "object": "transcription.job", "deleted": True}
 
 
 @app.post("/v1/audio/translations")

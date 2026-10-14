@@ -43,6 +43,21 @@ curl https://<user>-<space>.hf.space/v1/audio/transcriptions -H "Authorization: 
   -F file=@episode.mp3 -F response_format=srt
 ```
 
+**Long recordings in pieces** (used by the podcast server): create a job, upload the pieces in order,
+then complete it. The Space joins the pieces into one continuous recording before transcribing, so no
+word is lost at a piece boundary, and the client polls instead of holding one long request open.
+
+```bash
+API=https://<user>-<space>.hf.space/v1/audio/transcriptions/jobs; AUTH="Authorization: Bearer $API_KEY"
+ID=$(curl -s -H "$AUTH" -X POST $API -F task=transcribe | jq -r .id)
+curl -s -H "$AUTH" -X POST $API/$ID/parts -F index=0 -F file=@part0.ogg   # repeat for each piece
+curl -s -H "$AUTH" -X POST $API/$ID/complete
+curl -s -H "$AUTH" "$API/$ID?response_format=srt"                         # status until "completed"
+```
+
+Pieces must join without gaps, so send Ogg/Opus or FLAC (MP3 pads every piece by about 80 ms).
+Jobs are kept for 24 hours, in memory, so a restart loses unfinished ones.
+
 `WHISPER_MODEL` picks the size (default `small`; the Dockerfile bakes the same one into the image).
 On the free 2-CPU Space, `small` runs about 3× faster than real time for English and slower than
 real time for Chinese; `base` is about 3× faster than `small` but less accurate.

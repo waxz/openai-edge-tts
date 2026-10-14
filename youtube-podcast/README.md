@@ -14,9 +14,11 @@ short_description: Podcast RSS feeds for YouTube channels and playlists
 A small server that turns any YouTube channel or playlist into a podcast feed you can add to
 Apple Podcasts, Pocket Casts, AntennaPod, Overcast or any other podcast app.
 
-- Episode lists come from YouTube's public feeds: the newest 15 videos, no API key needed. Shorts are left out unless you add `?shorts=true`. When YouTube's feed fails (it sometimes returns 404 for every channel for hours), the list comes from yt-dlp instead; those episodes have approximate dates ("2 days ago") and no description.
-- Audio is downloaded with [yt-dlp](https://github.com/yt-dlp/yt-dlp) the first time an episode is played, saved as M4A (AAC), and served from a local cache with seeking support.
-- The newest episodes are downloaded in the background whenever a podcast app refreshes the feed, so they are ready to play.
+- Feeds list a channel's **complete** catalogue. The first time a feed is opened, the server lists every video with [yt-dlp](https://github.com/yt-dlp/yt-dlp) in the background (no downloads; a channel with 2,700 videos takes about 30 seconds) and stores the list. Until then the feed shows the newest 30.
+- The list stays **fresh**: every feed refresh (at most every 15 minutes) checks the newest videos from YouTube's public feed and adds new uploads. A full re-listing runs weekly to drop deleted videos and pick up renamed ones, or sooner if more new videos appeared than one refresh can see. When YouTube's feed is down, the check uses yt-dlp instead.
+- Episodes from YouTube's feed have exact dates and full descriptions. Older ones, from the yt-dlp listing, have approximate dates ("3 years ago") and the video link instead of a description.
+- **Audio is fetched only when an episode is played**: downloaded with yt-dlp on first play, saved as M4A (AAC), and served from a local cache with seeking support.
+- Shorts are left out unless you add `?shorts=true` (only Shorts among the newest uploads are included).
 - Optional transcripts: each downloaded episode is transcribed in the background with Whisper and the feed links it with `<podcast:transcript>`. Point `WHISPER_API_URL` at any OpenAI-compatible speech-to-text server, such as the Space in `hf-space/`, so the heavy model runs there and this server stays light.
 
 ## Feed URLs
@@ -55,7 +57,9 @@ python podcast.py          # listens on port 7860
 | `ACCESS_KEY` | none | Key for the web page (comma-separate several keys). See "Access" below. |
 | `CACHE_DIR` | `./cache` | Where audio is stored |
 | `CACHE_MAX_GB` | `5` | Oldest episodes are deleted above this size |
-| `PREFETCH` | `2` | Newest episodes to download in the background when a feed is read (0 = off) |
+| `PREFETCH` | `0` | Newest episodes to download in the background when a feed is read. 0 = audio only when played |
+| `MAX_EPISODES` | `0` | Most episodes per feed, newest first (0 = all) |
+| `CATALOG_RESYNC_DAYS` | `7` | Days between full re-listings of each channel |
 | `YTDLP_COOKIES` | none | Path to a YouTube `cookies.txt` |
 | `YTDLP_COOKIES_TEXT` | none | The `cookies.txt` contents, for hosts whose secrets are text |
 | `YTDLP_EXTRA_ARGS` | none | Extra yt-dlp arguments, e.g. `--js-runtimes node` |
@@ -88,8 +92,9 @@ pause between downloads, and after a rate-limit error it stops contacting YouTub
 fail for other reasons (private, removed) are not retried for an hour. `/status` shows the pause
 and recent errors.
 
-If 429s keep coming back: add cookies (below), lower `PREFETCH` to `1` or `0`, or raise
-`YTDLP_MIN_INTERVAL`.
+If 429s keep coming back: add cookies (below), keep `PREFETCH` at `0`, or raise
+`YTDLP_MIN_INTERVAL`. Some podcast apps download every episode when you subscribe; with a complete
+catalogue that's a lot of downloads, so turn automatic downloads off for these feeds in your app.
 
 ## Where to host it
 

@@ -10,8 +10,10 @@ Runs on its own (`python podcast.py`) or as a module mounted into a larger FastA
     GET /audio/{video_id}.m4a     the episode audio, downloaded with yt-dlp on first request and cached
     GET /transcript/{video_id}.vtt  episode transcript (.vtt, .srt, .txt or .json), made with Whisper
 
-Episode lists come from YouTube's public Atom feeds (newest 15 videos), which need no API key
-and are rarely rate limited; when a feed fails, the list comes from yt-dlp instead. Audio is fetched with yt-dlp, which YouTube may block from
+Feeds list a channel's complete catalogue: the first request lists every video with yt-dlp in the
+background (no downloads) and stores it under CACHE_DIR/catalog; every refresh then checks the newest
+videos (YouTube's Atom feed, or a short yt-dlp listing when that fails) and merges them in, and a full
+re-listing runs every CATALOG_RESYNC_DAYS to pick up renamed or deleted videos. Audio is fetched with yt-dlp, which YouTube may block from
 datacenter IPs; set YTDLP_COOKIES to a cookies.txt export if that happens.
 
 Environment:
@@ -22,7 +24,10 @@ Environment:
                       be used to download arbitrary videos. ?key=<key> is still accepted everywhere.
     CACHE_DIR         where audio is stored (default ./cache)
     CACHE_MAX_GB      oldest audio is deleted above this size (default 5)
-    PREFETCH          newest episodes to download in the background when a feed is read (default 2)
+    PREFETCH          newest episodes to download in the background when a feed is read (default 0:
+                      audio is fetched only when an episode is played)
+    MAX_EPISODES      most episodes per feed, newest first (default 0 = all)
+    CATALOG_RESYNC_DAYS  days between full re-listings of a channel (default 7)
     YTDLP_COOKIES     path to a Netscape cookies.txt for YouTube
     YTDLP_COOKIES_TEXT  the cookies.txt contents instead of a path (for hosts whose secrets are text)
     YTDLP_EXTRA_ARGS  extra yt-dlp arguments, e.g. "--js-runtimes node"
@@ -56,7 +61,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from email.utils import format_datetime
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -66,12 +71,15 @@ BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
 ACCESS_KEYS = [k.strip() for k in os.environ.get("ACCESS_KEY", "").split(",") if k.strip()]
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "cache"))
 CACHE_MAX_BYTES = int(float(os.environ.get("CACHE_MAX_GB", "5")) * 1024**3)
-PREFETCH = int(os.environ.get("PREFETCH", "2"))
+PREFETCH = int(os.environ.get("PREFETCH", "0"))
+MAX_EPISODES = int(os.environ.get("MAX_EPISODES", "0"))
+CATALOG_RESYNC = float(os.environ.get("CATALOG_RESYNC_DAYS", "7")) * 86400
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES", "")
 YTDLP_EXTRA_ARGS = shlex.split(os.environ.get("YTDLP_EXTRA_ARGS", ""))
 
 FEED_TTL = 15 * 60
-FALLBACK_EPISODES = 15  # same as YouTube's feed
+RECENT_EPISODES = 30  # how many of the newest videos a yt-dlp freshness check lists
+FULL_LISTING_TIMEOUT = 30 * 60
 DOWNLOAD_TIMEOUT = 30 * 60
 YTDLP_MIN_INTERVAL = float(os.environ.get("YTDLP_MIN_INTERVAL", "20"))
 RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "900"))
@@ -118,6 +126,8 @@ if os.environ.get("YTDLP_COOKIES_TEXT") and not YTDLP_COOKIES:
     Path(YTDLP_COOKIES).write_text(os.environ["YTDLP_COOKIES_TEXT"].replace("\\n", "\n") + "\n")
 _feed_cache: dict[str, tuple[float, dict]] = {}
 _channel_cache: dict[str, dict] = {}
+_catalog_syncs: dict[str, dict] = {}  # key -> {"state": "running"|"done"|"failed", "at": ..., "error": ...}
+_catalog_lock = threading.Lock()  # one full listing at a time
 _download_locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
@@ -238,31 +248,127 @@ def parse_source(source: str) -> tuple[str, str]:
 
 
 def load_feed(kind: str, ident: str) -> dict:
-    """Channel or playlist metadata and its newest episodes, from YouTube's Atom feed or, when that
-    fails (it sometimes returns 404 for every channel for hours), from a yt-dlp listing."""
-    key = f"{kind}:{ident}"
+    """Channel or playlist metadata and its complete episode list, newest first.
+
+    The newest videos come from YouTube's Atom feed (exact dates, descriptions) or, when that fails
+    (it sometimes returns 404 for every channel for hours), from a short yt-dlp listing. They are
+    merged into the stored catalogue of every video, which a background yt-dlp listing builds on the
+    first request and rebuilds every CATALOG_RESYNC_DAYS."""
+    artwork = {}
+    if kind == "handle":
+        artwork = channel_page_info(ident)  # cached after the first lookup
+        kind, ident = "channel", artwork["channel_id"]
+    key = f"{kind}:{ident}"  # one cache entry per channel, however it was addressed
     cached = _feed_cache.get(key)
     if cached and time.time() - cached[0] < FEED_TTL:
         return cached[1]
-
-    artwork = {}
-    if kind == "handle":
-        artwork = channel_page_info(ident)
-        kind, ident = "channel", artwork["channel_id"]
-    elif kind == "channel":
+    if kind == "channel" and not artwork:
         try:
             artwork = channel_page_info(f"channel/{ident}")
         except Exception:
             artwork = {}
 
     try:
-        feed = _feed_from_atom(kind, ident, artwork)
+        fresh = _feed_from_atom(kind, ident, artwork)
     except (urllib.error.HTTPError, HTTPException, ET.ParseError) as e:
         reason = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else getattr(e, "detail", None) or str(e)
         print(f"YouTube feed for {kind} {ident} failed ({reason}); listing with yt-dlp instead", flush=True)
-        feed = _feed_from_ytdlp(kind, ident, artwork)
+        fresh = _feed_from_ytdlp(kind, ident, artwork, limit=RECENT_EPISODES)
+
+    catalog = load_catalog(kind, ident)
+    known = {e["id"] for e in catalog["episodes"]} if catalog else set()
+    episodes = _merge_episodes(fresh["episodes"], catalog["episodes"] if catalog else [], by_date=kind == "channel")
+    if catalog:
+        save_catalog(kind, ident, {**catalog, "episodes": episodes})  # keep new uploads between full listings
+    # Full listing: none yet, due again, or more new videos than the freshness check can see.
+    gap = bool(catalog) and bool(fresh["episodes"]) and not any(e["id"] in known for e in fresh["episodes"])
+    if catalog is None or time.time() - catalog["synced_at"] > CATALOG_RESYNC or gap:
+        start_catalog_sync(kind, ident, artwork)
+
+    feed = {**fresh, "episodes": episodes[:MAX_EPISODES] if MAX_EPISODES else episodes,
+            "complete": catalog is not None, "catalog_synced_at": catalog["synced_at"] if catalog else None}
     _feed_cache[key] = (time.time(), feed)
     return feed
+
+
+def _merge_episodes(newest: list[dict], catalog: list[dict], by_date: bool) -> list[dict]:
+    """Newest list first (its metadata wins), then the rest of the catalogue in its order. For channels,
+    approximate dates ("3 years ago") are nudged so they never break the newest-first order."""
+    stored = {e["id"]: e for e in catalog}
+    merged = []
+    for e in newest:
+        old = stored.get(e["id"])
+        if old and old.get("exact") and not e.get("exact"):
+            # A yt-dlp listing has approximate dates and no description: keep what YouTube's feed gave us.
+            e = {**e, "published": old["published"], "description": old["description"], "exact": True}
+        merged.append(dict(e))
+    seen = {e["id"] for e in newest}
+    merged += [dict(e) for e in catalog if e["id"] not in seen]
+    if by_date:
+        for prev, ep in zip(merged, merged[1:]):
+            if ep["published"] >= prev["published"]:
+                ep["published"] = prev["published"] - timedelta(minutes=1)
+    return merged
+
+
+# ---------------------------------------------------------------- catalogue (complete episode lists)
+
+def catalog_path(kind: str, ident: str) -> Path:
+    return CACHE_DIR / "catalog" / f"{kind}-{ident}.json"
+
+
+def load_catalog(kind: str, ident: str) -> dict | None:
+    try:
+        data = json.loads(catalog_path(kind, ident).read_text())
+    except (OSError, ValueError):
+        return None
+    for ep in data["episodes"]:
+        ep["published"] = datetime.fromisoformat(ep["published"])
+    return data
+
+
+def save_catalog(kind: str, ident: str, catalog: dict):
+    path = catalog_path(kind, ident)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {**catalog, "episodes": [{**e, "published": e["published"].isoformat()} for e in catalog["episodes"]]}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False))
+    tmp.replace(path)
+
+
+def start_catalog_sync(kind: str, ident: str, artwork: dict):
+    """List every video of the channel or playlist in the background and store it."""
+    key = f"{kind}:{ident}"
+    with _locks_guard:
+        state = _catalog_syncs.get(key, {})
+        if state.get("state") == "running":
+            return
+        if state.get("state") == "failed" and time.time() - state["at"] < FAILED_VIDEO_TTL:
+            return  # failed recently; don't retry on every refresh
+        _catalog_syncs[key] = {"state": "running", "at": time.time()}
+
+    def run():
+        with _catalog_lock:
+            started = time.time()
+            try:
+                listed = _feed_from_ytdlp(kind, ident, artwork, limit=None)
+                old = load_catalog(kind, ident)
+                # The full listing is authoritative (drops deleted videos), but keep the exact dates
+                # and descriptions that freshness checks got from YouTube's feed.
+                exact = {e["id"]: e for e in (old or {}).get("episodes", []) if e.get("exact")}
+                episodes = [{**e, **{k: exact[e["id"]][k] for k in ("published", "description", "exact")}} if e["id"] in exact else e
+                            for e in listed["episodes"]]
+                episodes = _merge_episodes([], episodes, by_date=kind == "channel")
+                save_catalog(kind, ident, {"synced_at": time.time(), "episodes": episodes})
+                _feed_cache.pop(key, None)  # next refresh shows the complete list
+                _catalog_syncs[key] = {"state": "done", "at": time.time(), "episodes": len(episodes)}
+                print(f"catalogue {key}: {len(episodes)} episodes listed in {time.time() - started:.0f}s", flush=True)
+            except Exception as e:
+                detail = getattr(e, "detail", None) or str(e)
+                _catalog_syncs[key] = {"state": "failed", "at": time.time(), "error": detail}
+                print(f"catalogue {key} failed: {detail}", flush=True)
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _feed_from_atom(kind: str, ident: str, artwork: dict) -> dict:
@@ -282,6 +388,7 @@ def _feed_from_atom(kind: str, ident: str, artwork: dict) -> dict:
             "thumbnail": thumb.get("url") if thumb is not None else None,
             "link": link,
             "short": "/shorts/" in link,
+            "exact": True,  # exact date and full description
         })
     alternate = root.find("a:link[@rel='alternate']", NS)
     return {
@@ -295,7 +402,7 @@ def _feed_from_atom(kind: str, ident: str, artwork: dict) -> dict:
     }
 
 
-def _feed_from_ytdlp(kind: str, ident: str, artwork: dict) -> dict:
+def _feed_from_ytdlp(kind: str, ident: str, artwork: dict, limit: int | None) -> dict:
     """List the newest videos without downloading anything. The listing has no descriptions and
     only approximate publish times ("2 days ago"), which is enough for podcast apps to order episodes."""
     try:
@@ -304,12 +411,12 @@ def _feed_from_ytdlp(kind: str, ident: str, artwork: dict) -> dict:
         raise HTTPException(503, str(e), headers={"Retry-After": str(e.retry_after)})
     url = f"https://www.youtube.com/channel/{ident}/videos" if kind == "channel" else f"https://www.youtube.com/playlist?list={ident}"
     cmd = [
-        "yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", str(FALLBACK_EPISODES),
+        "yt-dlp", "--flat-playlist", "--dump-single-json", *(["--playlist-end", str(limit)] if limit else []),
         "--extractor-args", "youtubetab:approximate_date", "--extractor-retries", "0",
         *(["--cookies", YTDLP_COOKIES] if YTDLP_COOKIES else []), *YTDLP_EXTRA_ARGS, url,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120 if limit else FULL_LISTING_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, f"Listing {kind} {ident} with yt-dlp timed out")
     if result.returncode != 0:
@@ -722,7 +829,7 @@ document.getElementById('f').onsubmit=async function(e){
     try{d=JSON.parse(t)}catch(e){throw new Error('Server answered '+r.status+': '+(t.replace(/<[^>]*>/g,' ').trim().slice(0,200)||r.statusText))}
     if(!r.ok)throw new Error(d.detail||('Error '+r.status));
     try{localStorage.setItem('podcastKey',k.value)}catch(e){}
-    o.innerHTML='';var p=document.createElement('p');p.textContent='Feed for '+d.title+' ('+d.episodes+' episodes):';
+    o.innerHTML='';var p=document.createElement('p');p.textContent='Feed for '+d.title+' ('+d.episodes+' episodes'+(d.complete?'':' so far; the full list is being fetched and will appear in your podcast app within minutes')+'):';
     var c=document.createElement('code');c.textContent=d.feed_url;var b=document.createElement('button');b.textContent='Copy';
     b.onclick=function(){navigator.clipboard.writeText(d.feed_url);b.textContent='Copied'};o.append(p,c,b);
   }catch(err){o.innerHTML='';var p=document.createElement('p');p.className='err';p.textContent=err.message;o.append(p)}
@@ -737,7 +844,7 @@ def api_feed_url(request: Request, url: str, shorts: bool = False):
     kind, ident = parse_source(url)
     data = load_feed(kind, ident)  # fails with a clear error if the channel or playlist doesn't exist
     episodes = sum(1 for e in data["episodes"] if shorts or not e["short"])
-    return {"feed_url": signed_feed_url(base_url(request), ident, shorts), "title": data["title"], "episodes": episodes}
+    return {"feed_url": signed_feed_url(base_url(request), ident, shorts), "title": data["title"], "episodes": episodes, "complete": data["complete"]}
 
 
 _health_cache: dict = {"at": 0.0, "result": None}
@@ -785,6 +892,7 @@ def status(request: Request):
         "failed_videos": {vid: err for vid, (at, err) in _failed_videos.items() if time.time() - at < FAILED_VIDEO_TTL},
         "cached_episodes": len(list(CACHE_DIR.glob("*.m4a"))),
         "transcripts_pending": len(_transcribe_pending),
+        "catalogues": {k: {**v, "at": int(v["at"])} for k, v in _catalog_syncs.items()},
         "cookies": bool(YTDLP_COOKIES),
         "transcripts": ("remote " + WHISPER_API_URL) if WHISPER_API_URL and transcribe_audio else ("local" if transcribe_audio else "off"),
     }

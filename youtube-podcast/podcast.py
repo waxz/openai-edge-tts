@@ -11,7 +11,7 @@ Runs on its own (`python podcast.py`) or as a module mounted into a larger FastA
     GET /transcript/{video_id}.vtt  episode transcript (.vtt, .srt, .txt or .json), made with Whisper
 
 Episode lists come from YouTube's public Atom feeds (newest 15 videos), which need no API key
-and are rarely rate limited. Audio is fetched with yt-dlp, which YouTube may block from
+and are rarely rate limited; when a feed fails, the list comes from yt-dlp instead. Audio is fetched with yt-dlp, which YouTube may block from
 datacenter IPs; set YTDLP_COOKIES to a cookies.txt export if that happens.
 
 Environment:
@@ -56,7 +56,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from email.utils import format_datetime
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -71,6 +71,7 @@ YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES", "")
 YTDLP_EXTRA_ARGS = shlex.split(os.environ.get("YTDLP_EXTRA_ARGS", ""))
 
 FEED_TTL = 15 * 60
+FALLBACK_EPISODES = 15  # same as YouTube's feed
 DOWNLOAD_TIMEOUT = 30 * 60
 YTDLP_MIN_INTERVAL = float(os.environ.get("YTDLP_MIN_INTERVAL", "20"))
 RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "900"))
@@ -237,6 +238,8 @@ def parse_source(source: str) -> tuple[str, str]:
 
 
 def load_feed(kind: str, ident: str) -> dict:
+    """Channel or playlist metadata and its newest episodes, from YouTube's Atom feed or, when that
+    fails (it sometimes returns 404 for every channel for hours), from a yt-dlp listing."""
     key = f"{kind}:{ident}"
     cached = _feed_cache.get(key)
     if cached and time.time() - cached[0] < FEED_TTL:
@@ -246,17 +249,25 @@ def load_feed(kind: str, ident: str) -> dict:
     if kind == "handle":
         artwork = channel_page_info(ident)
         kind, ident = "channel", artwork["channel_id"]
-    param = "channel_id" if kind == "channel" else "playlist_id"
-    try:
-        root = ET.fromstring(http_get(f"https://www.youtube.com/feeds/videos.xml?{param}={ident}"))
-    except urllib.error.HTTPError as e:
-        raise HTTPException(404 if e.code == 404 else 502, f"YouTube feed for {kind} {ident} returned {e.code}")
-    if kind == "channel" and not artwork:
+    elif kind == "channel":
         try:
             artwork = channel_page_info(f"channel/{ident}")
         except Exception:
             artwork = {}
 
+    try:
+        feed = _feed_from_atom(kind, ident, artwork)
+    except (urllib.error.HTTPError, HTTPException, ET.ParseError) as e:
+        reason = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else getattr(e, "detail", None) or str(e)
+        print(f"YouTube feed for {kind} {ident} failed ({reason}); listing with yt-dlp instead", flush=True)
+        feed = _feed_from_ytdlp(kind, ident, artwork)
+    _feed_cache[key] = (time.time(), feed)
+    return feed
+
+
+def _feed_from_atom(kind: str, ident: str, artwork: dict) -> dict:
+    param = "channel_id" if kind == "channel" else "playlist_id"
+    root = ET.fromstring(http_get(f"https://www.youtube.com/feeds/videos.xml?{param}={ident}"))
     episodes = []
     for entry in root.findall("a:entry", NS):
         video_id = entry.findtext("yt:videoId", namespaces=NS)
@@ -272,17 +283,70 @@ def load_feed(kind: str, ident: str) -> dict:
             "link": link,
             "short": "/shorts/" in link,
         })
-
-    feed = {
+    alternate = root.find("a:link[@rel='alternate']", NS)
+    return {
         "title": root.findtext("a:title", namespaces=NS) or artwork.get("title") or ident,
         "author": root.findtext("a:author/a:name", namespaces=NS) or "",
-        "link": (root.find("a:link[@rel='alternate']", NS).get("href") if root.find("a:link[@rel='alternate']", NS) is not None else "https://www.youtube.com"),
+        "link": alternate.get("href") if alternate is not None else "https://www.youtube.com",
         "description": artwork.get("description") or "",
         "image": artwork.get("image") or next((e["thumbnail"] for e in episodes if e["thumbnail"]), None),
         "episodes": episodes,
+        "source": "youtube feed",
     }
-    _feed_cache[key] = (time.time(), feed)
-    return feed
+
+
+def _feed_from_ytdlp(kind: str, ident: str, artwork: dict) -> dict:
+    """List the newest videos without downloading anything. The listing has no descriptions and
+    only approximate publish times ("2 days ago"), which is enough for podcast apps to order episodes."""
+    try:
+        _check_rate_limit()
+    except RateLimited as e:
+        raise HTTPException(503, str(e), headers={"Retry-After": str(e.retry_after)})
+    url = f"https://www.youtube.com/channel/{ident}/videos" if kind == "channel" else f"https://www.youtube.com/playlist?list={ident}"
+    cmd = [
+        "yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", str(FALLBACK_EPISODES),
+        "--extractor-args", "youtubetab:approximate_date", "--extractor-retries", "0",
+        *(["--cookies", YTDLP_COOKIES] if YTDLP_COOKIES else []), *YTDLP_EXTRA_ARGS, url,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, f"Listing {kind} {ident} with yt-dlp timed out")
+    if result.returncode != 0:
+        error = next((l for l in reversed(result.stderr.splitlines()) if l.startswith("ERROR")), result.stderr[-300:]).strip()
+        try:
+            _record_failure(f"list:{ident}", error)  # starts the rate-limit pause on a 429 / bot check
+        except RateLimited as e:
+            raise HTTPException(503, str(e), headers={"Retry-After": str(e.retry_after)})
+        not_found = any(w in error.lower() for w in ("does not exist", "not found", "404", "unavailable"))
+        raise HTTPException(404 if not_found else 502, f"Could not list {kind} {ident}: {error}")
+
+    data = json.loads(result.stdout)
+    now = time.time()
+    episodes = []
+    for i, entry in enumerate(e for e in data.get("entries") or [] if e.get("id")):
+        # Keep YouTube's newest-first order even where the listing has no date.
+        timestamp = entry.get("timestamp") or entry.get("release_timestamp") or now - i * 60
+        episodes.append({
+            "id": entry["id"],
+            "title": entry.get("title") or entry["id"],
+            "published": datetime.fromtimestamp(timestamp, tz=timezone.utc),
+            "description": entry.get("description") or "",
+            "thumbnail": f"https://i.ytimg.com/vi/{entry['id']}/hqdefault.jpg",
+            "link": f"https://www.youtube.com/watch?v={entry['id']}",
+            "short": False,  # the /videos tab and playlists list regular videos
+            "duration": int(entry["duration"]) if entry.get("duration") else None,
+        })
+    title = (data.get("title") if kind == "playlist" else None) or artwork.get("title") or data.get("channel") or data.get("title") or ident
+    return {
+        "title": title,
+        "author": data.get("channel") or data.get("uploader") or title,
+        "link": f"https://www.youtube.com/channel/{ident}" if kind == "channel" else f"https://www.youtube.com/playlist?list={ident}",
+        "description": artwork.get("description") or data.get("description") or "",
+        "image": artwork.get("image") or next((e["thumbnail"] for e in episodes), None),
+        "episodes": episodes,
+        "source": "yt-dlp",
+    }
 
 
 # ---------------------------------------------------------------- audio cache
@@ -614,7 +678,7 @@ def build_rss(feed: dict, base: str, include_shorts: bool) -> bytes:
         sub(item, "enclosure", url=f"{base}/audio/{ep['id']}.m4a{episode_query(ep['id'])}", type="audio/mp4", length=size)
         if ep["thumbnail"]:
             sub(item, f"{{{ITUNES}}}image", href=ep["thumbnail"])
-        if duration := audio_meta(ep["id"]).get("duration"):
+        if duration := audio_meta(ep["id"]).get("duration") or ep.get("duration"):
             sub(item, f"{{{ITUNES}}}duration", str(duration))
         if transcript := load_transcript(ep["id"]):
             for fmt in ("vtt", "srt"):

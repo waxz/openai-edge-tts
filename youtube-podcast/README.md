@@ -14,7 +14,7 @@ short_description: Podcast RSS feeds for YouTube channels and playlists
 A small server that turns any YouTube channel or playlist into a podcast feed you can add to
 Apple Podcasts, Pocket Casts, AntennaPod, Overcast or any other podcast app.
 
-- Episode lists come from YouTube's public feeds: the newest 15 videos, no API key needed. Shorts are left out unless you add `?shorts=true`.
+- Episode lists come from YouTube's public feeds: the newest 15 videos, no API key needed. Shorts are left out unless you add `?shorts=true`. When YouTube's feed fails (it sometimes returns 404 for every channel for hours), the list comes from yt-dlp instead; those episodes have approximate dates ("2 days ago") and no description.
 - Audio is downloaded with [yt-dlp](https://github.com/yt-dlp/yt-dlp) the first time an episode is played, saved as M4A (AAC), and served from a local cache with seeking support.
 - The newest episodes are downloaded in the background whenever a podcast app refreshes the feed, so they are ready to play.
 - Optional transcripts: each downloaded episode is transcribed in the background with Whisper and the feed links it with `<podcast:transcript>`. Point `WHISPER_API_URL` at any OpenAI-compatible speech-to-text server, such as the Space in `hf-space/`, so the heavy model runs there and this server stays light.
